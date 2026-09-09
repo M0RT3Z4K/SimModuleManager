@@ -1,0 +1,13 @@
+{
+  "http_status": 200,
+  "capture_window_seconds": 15,
+  "bytes": 1297408,
+  "pcm16_samples": 648704,
+  "nonzero_bytes": 0,
+  "all_samples_zero": true,
+  "observed_sample_delivery_rate_second_test": 43883.52953927403,
+  "expected_sample_rate": 8000,
+  "spectrum_analysis": "Not meaningful: all samples are zero.",
+  "input_clipping": "Cannot determine from DC-removed PCM; need raw ADC readings.",
+  "rate_caveat": "TCP delivery rate, not a direct measurement of ADC clock."
+}

@@ -1,0 +1,17 @@
+{
+  "sample_rate_assumed": 43904,
+  "duration_seconds": 14.927113702623906,
+  "quiet_frames": 512,
+  "common_gain": 20.15953559422591,
+  "metrics": {
+    "gentle": {
+      "quiet_frame_attenuation_db_same_gain": -4.481012250539369,
+      "active_frame_attenuation_db_same_gain": -0.060268917872296386
+    },
+    "strong": {
+      "quiet_frame_attenuation_db_same_gain": -7.429885155440888,
+      "active_frame_attenuation_db_same_gain": -0.09571856265346707
+    }
+  },
+  "note": "Quiet frames are inferred, not labeled. Attenuation is not an SNR or intelligibility measurement."
+}

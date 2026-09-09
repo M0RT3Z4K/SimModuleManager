@@ -1,0 +1,122 @@
+{
+  "samples": 655360,
+  "capture_seconds": 15.030681416974403,
+  "nonzero_samples": 655325,
+  "min": -14280,
+  "max": 21671,
+  "mean": 1.4098709106445313,
+  "rms": 7372.550654617824,
+  "pcm_clipped_percent": 0.0,
+  "observed_delivery_samples_per_second": 43901.856549708114,
+  "configured_playback_samples_per_second": 8000,
+  "trial_playback_rate": 43902,
+  "caveats": [
+    "TCP delivery rate is not a direct ADC clock measurement.",
+    "PCM clipping does not establish whether the analog input clipped before DC removal.",
+    "Trial files assume consecutive mono samples; duplicate or invalid ADC words require raw ADC diagnostics."
+  ],
+  "lag_correlations": {
+    "1": 0.9986087265204304,
+    "2": 0.998902284094084,
+    "3": 0.9977037004915751,
+    "4": 0.9973557504272321,
+    "8": 0.9918348236693962,
+    "16": 0.971923532306809
+  },
+  "strongest_bins_hz_at_trial_rate": [
+    53.59130859375,
+    42.873046875,
+    96.46435546875,
+    107.1826171875,
+    150.0556640625,
+    64.3095703125,
+    203.64697265625,
+    139.33740234375,
+    192.9287109375,
+    85.74609375
+  ],
+  "power_fraction_by_band_at_trial_rate": {
+    "0-300": 0.9884082051613126,
+    "300-3400": 0.010732318979601061,
+    "3400-21951.0": 0.0008592187822407555
+  },
+  "one_second_windows_at_trial_rate": [
+    {
+      "start": 0.0,
+      "rms": 7388.667055869359,
+      "peak": 20418
+    },
+    {
+      "start": 1.0,
+      "rms": 7429.273406257663,
+      "peak": 20148
+    },
+    {
+      "start": 2.0,
+      "rms": 7421.036225481021,
+      "peak": 20763
+    },
+    {
+      "start": 3.0,
+      "rms": 7495.281079022697,
+      "peak": 20531
+    },
+    {
+      "start": 4.0,
+      "rms": 7402.568992868793,
+      "peak": 20488
+    },
+    {
+      "start": 5.0,
+      "rms": 7452.997397923381,
+      "peak": 20867
+    },
+    {
+      "start": 6.0,
+      "rms": 7587.905502403019,
+      "peak": 21671
+    },
+    {
+      "start": 7.0,
+      "rms": 7364.426970618695,
+      "peak": 20545
+    },
+    {
+      "start": 8.0,
+      "rms": 7371.611332339326,
+      "peak": 20964
+    },
+    {
+      "start": 9.0,
+      "rms": 7339.4354764348955,
+      "peak": 20494
+    },
+    {
+      "start": 10.0,
+      "rms": 7378.990005926441,
+      "peak": 20362
+    },
+    {
+      "start": 11.0,
+      "rms": 7325.825785536093,
+      "peak": 20442
+    },
+    {
+      "start": 12.0,
+      "rms": 7296.196552479144,
+      "peak": 20703
+    },
+    {
+      "start": 13.0,
+      "rms": 7186.411677312813,
+      "peak": 20386
+    },
+    {
+      "start": 14.0,
+      "rms": 7117.0376734951415,
+      "peak": 20605
+    }
+  ],
+  "filtered_rms_before_gain": 689.9677568086897,
+  "filtered_playback_gain": 1.6533415497540733
+}

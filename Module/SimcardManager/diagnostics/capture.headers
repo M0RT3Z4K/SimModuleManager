@@ -1,0 +1,6 @@
+HTTP/1.1 200 OK
+Content-Type: application/octet-stream
+Cache-Control: no-store
+Access-Control-Allow-Origin: *
+Connection: close
+

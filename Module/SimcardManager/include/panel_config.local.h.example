@@ -1,0 +1,5 @@
+#pragma once
+#define PANEL_BASE_URL "http://10.10.30.1:3000"
+// Same registration credential as DEVICE_REGISTRATION_TOKEN in the backend.
+#define DEVICE_REGISTRATION_TOKEN "REPLACE_WITH_PANEL_REGISTRATION_TOKEN"
+#define AUDIO_OUTPUT_SAMPLE_RATE 8000
