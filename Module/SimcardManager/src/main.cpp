@@ -613,6 +613,7 @@ void handleHealthCheck() {
     doc["sample_counter"] = uint64String(getSampleCounter());
     doc["audio_wiring_verified"] = false; // Software cannot establish physical connectivity.
     doc["modem_audio_channel"] = MODEM_AUDIO_CHANNEL;
+    doc["modem_speaker_level"] = MODEM_SPEAKER_LEVEL;
     doc["modem_audio_configured"] = modemAudioConfigured;
     
     String response;
@@ -722,6 +723,31 @@ void handleListen() {
     server.send_P(200, "text/html; charset=utf-8", LISTEN_PAGE);
 }
 
+struct AudioLowPass {
+    float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+    float z1 = 0, z2 = 0;
+
+    void configure(float sampleRate, float cutoff, float q) {
+        const float omega = 2.0f * 3.14159265358979323846f * cutoff / sampleRate;
+        const float cosine = cosf(omega);
+        const float alpha = sinf(omega) / (2.0f * q);
+        const float inverseA0 = 1.0f / (1.0f + alpha);
+        b0 = ((1.0f - cosine) * 0.5f) * inverseA0;
+        b1 = (1.0f - cosine) * inverseA0;
+        b2 = b0;
+        a1 = (-2.0f * cosine) * inverseA0;
+        a2 = (1.0f - alpha) * inverseA0;
+        z1 = z2 = 0;
+    }
+
+    float process(float input) {
+        const float output = b0 * input + z1;
+        z1 = b1 * input - a1 * output + z2;
+        z2 = b2 * input - a2 * output;
+        return output;
+    }
+};
+
 // Own the ADC and streaming socket here so slow AT/HTTP operations in loop()
 // cannot starve audio. Continue draining DMA even when nobody is listening.
 void audioStreamTask(void* parameter) {
@@ -732,8 +758,9 @@ void audioStreamTask(void* parameter) {
     bool dcInitialized = false;
     uint64_t calibrationSamples = 0;
     int64_t calibrationStartUs = 0;
-    int64_t outputStartUs = 0;
-    uint64_t outputSamplesProduced = 0;
+    uint64_t resamplePhase = 0;
+    AudioLowPass antiAliasStage1;
+    AudioLowPass antiAliasStage2;
     bool calibrationPrimed = false;
     for (;;) {
         if (audioServer.hasClient()) {
@@ -797,42 +824,34 @@ void audioStreamTask(void* parameter) {
                 SerialMon.printf("[AUDIO] 10s clock test: %llu samples in %.3fs = %u raw samples/s; output=%u Hz (%s).\n",
                                  (unsigned long long)calibrationSamples, elapsed / 1000000.0,
                                  measuredRawSampleRate, AUDIO_OUTPUT_SAMPLE_RATE,
-                                 audioRateVerified ? "verified by paced decimation" : "FAILED");
+                                 audioRateVerified ? "verified by filtered decimation" : "FAILED");
                 if (!audioRateVerified) audioReady = false;
-                outputStartUs = esp_timer_get_time();
-                outputSamplesProduced = 0;
+                if (audioRateVerified) {
+                    const float cutoff = min(3400.0f, AUDIO_OUTPUT_SAMPLE_RATE * 0.42f);
+                    // Two Butterworth sections form a fourth-order anti-alias
+                    // filter before samples are discarded by the decimator.
+                    antiAliasStage1.configure(measuredRawSampleRate, cutoff, 0.5411961f);
+                    antiAliasStage2.configure(measuredRawSampleRate, cutoff, 1.3065630f);
+                    resamplePhase = 0;
+                }
                 panelRegistered = false; // Re-register with verified stream metadata.
                 registrationRetryMs = 0;
             }
             continue;
         }
-        uint64_t desiredTotal = (uint64_t)((esp_timer_get_time() - outputStartUs) * AUDIO_OUTPUT_SAMPLE_RATE / 1000000LL);
-        uint64_t wanted = desiredTotal > outputSamplesProduced ? desiredTotal - outputSamplesProduced : 0;
-        size_t pcmCount = wanted > rawCount ? rawCount : (size_t)wanted;
-        if (!pcmCount) {
-            for (size_t i = 0; i < rawCount; ++i) {
-                float sample = raw[i] & 0x0fff;
-                if (!dcInitialized) { dc = sample; dcInitialized = true; }
-                dc += 0.005f * (sample - dc);
-            }
-        } else {
-            // Each output sample is the average of its share of the uniformly
-            // clocked raw block. This also supplies a small anti-aliasing filter.
-            for (size_t out = 0; out < pcmCount; ++out) {
-                size_t begin = out * rawCount / pcmCount;
-                size_t end = (out + 1) * rawCount / pcmCount;
-                float sum = 0;
-                for (size_t i = begin; i < end; ++i) {
-                    float sample = raw[i] & 0x0fff;
-                    if (!dcInitialized) { dc = sample; dcInitialized = true; }
-                    dc += 0.005f * (sample - dc);
-                    sum += sample - dc;
-                }
-                float value = end > begin ? (sum / (end - begin)) * 16.0f : 0;
-                pcm[out] = (int16_t)constrain(value, -32768.0f, 32767.0f);
+        size_t pcmCount = 0;
+        for (size_t i = 0; i < rawCount; ++i) {
+            const float sample = raw[i] & 0x0fff;
+            if (!dcInitialized) { dc = sample; dcInitialized = true; }
+            dc += 0.005f * (sample - dc);
+            const float centered = (sample - dc) * 16.0f;
+            const float filtered = antiAliasStage2.process(antiAliasStage1.process(centered));
+            resamplePhase += AUDIO_OUTPUT_SAMPLE_RATE;
+            if (resamplePhase >= measuredRawSampleRate) {
+                resamplePhase -= measuredRawSampleRate;
+                pcm[pcmCount++] = (int16_t)constrain(filtered, -32768.0f, 32767.0f);
             }
         }
-        outputSamplesProduced += pcmCount;
         portENTER_CRITICAL(&sampleCounterMux);
         sampleCounter += pcmCount;
         portEXIT_CRITICAL(&sampleCounterMux);
@@ -1060,9 +1079,12 @@ void loop() {
 
             // Audio Configuration for Calls
             String channelResponse = sendAT(String("AT+CHFA=") + MODEM_AUDIO_CHANNEL, 1000, true);
-            String volumeResponse = sendAT("AT+CLVL=20", 1000, true); // Low analog speaker level
+            // Gain at the modem improves ADC SNR; backend normalization cannot
+            // recover speech detail already buried below the analog noise floor.
+            String volumeResponse = sendAT(String("AT+CLVL=") + MODEM_SPEAKER_LEVEL, 1000, true);
             modemAudioConfigured = channelResponse.endsWith("OK") && volumeResponse.endsWith("OK");
-            SerialMon.printf("[AUDIO] Analog channel %d configuration: %s\n", MODEM_AUDIO_CHANNEL,
+            SerialMon.printf("[AUDIO] Analog channel %d, speaker level %d: %s\n",
+                             MODEM_AUDIO_CHANNEL, MODEM_SPEAKER_LEVEL,
                              modemAudioConfigured ? "OK (external wiring still required)" : "FAILED");
             
             SerialMon.println("[SIM] Modem configured for SMS and Voice Calls. Waiting for network...");

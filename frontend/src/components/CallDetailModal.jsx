@@ -4,6 +4,7 @@ import { api } from '../api';
 import AudioAsset from './AudioAsset';
 
 const labels = { ready: 'آماده', recording: 'در حال ضبط', queued: 'در صف', processing: 'در حال پردازش', transcribing: 'در حال تبدیل', failed: 'ناموفق', waiting: 'منتظر', incomplete: 'ناقص', skipped: 'رد شده', no_signal: 'بدون سیگنال' };
+const profileLabels = { raw: 'خام', mild: 'شفاف‌سازی متعادل', strong: 'شفاف‌سازی قوی' };
 
 export default function CallDetailModal({ callId, onClose, onChanged }) {
   const [call, setCall] = useState(null);
@@ -29,15 +30,16 @@ export default function CallDetailModal({ callId, onClose, onChanged }) {
           <div><span>وضعیت صوت اصلی</span><b>{labels[call.recording_status] || call.recording_status}</b></div>
           <div><span>پردازش / متن</span><b>{labels[call.processing_status] || call.processing_status} / {labels[call.transcription_status] || call.transcription_status}</b></div>
           <div><span>نرخ ورودی / خروجی</span><b>{call.input_sample_rate || '؟'} / {call.output_sample_rate || '؟'} Hz</b></div>
-          <div><span>پروفایل</span><b>{call.audio_profile || 'mild'}</b></div>
+          <div><span>پروفایل</span><b>{profileLabels[call.audio_profile] || profileLabels.mild}</b></div>
         </div>
         {call.original_available && <AudioAsset callId={call.id} variant="original" label="فایل اصلی" />}
-        {call.processed_available && <AudioAsset callId={call.id} variant="processed" label="نسخهٔ پردازش‌شده" />}
+        {call.processed_available && <AudioAsset callId={call.id} variant="processed" label="نسخهٔ پردازش‌شده"
+          revision={`${call.processing_version || ''}:${call.processing_attempts}:${call.updated_at}`} />}
         {(call.processing_error || call.transcription_error) && <div className="inline-error">{call.processing_error || call.transcription_error}</div>}
         <div className="retry-row">
           <button className="btn btn-secondary" onClick={() => retry('process', call.audio_profile)}><RefreshCw size={15}/> پردازش دوباره</button>
           <button className="btn btn-secondary" onClick={() => retry('transcribe')} disabled={!call.original_available}><RefreshCw size={15}/> ترنسکرایب دوباره</button>
-          <select className="form-input compact" value={call.audio_profile || 'mild'} onChange={e => retry('process', e.target.value)}><option value="raw">خام</option><option value="mild">ملایم</option><option value="strong">قوی</option></select>
+          <select className="form-input compact" value={call.audio_profile || 'mild'} onChange={e => retry('process', e.target.value)}><option value="raw">خام (بدون حذف نویز)</option><option value="mild">شفاف‌سازی متعادل</option><option value="strong">شفاف‌سازی قوی</option></select>
         </div>
         <div className="transcript-header"><h3>متن مکالمه</h3><div className="search-box"><Search size={15}/><input value={search} onChange={e => setSearch(e.target.value)} placeholder="جست‌وجو" /></div><button className="btn btn-secondary" disabled={!call.transcript} onClick={() => navigator.clipboard.writeText(call.transcript)}><Copy size={15}/> کپی</button></div>
         <div className="transcript" lang="fa" dir="rtl">{transcript || (call.transcription_status === 'ready' ? 'متنی بازگردانده نشد.' : 'متن هنوز آماده نیست.')}</div>

@@ -4,16 +4,30 @@ process.env.CALL_STORAGE_DIR = `/tmp/simcard-core-audio-${process.pid}`;
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { Pcm16Assembler, ByteRingBuffer } = require('../src/audio/pcm');
 const { wavHeader, parseWav, audioStats, audioStatsFile, WavAppender, splitWav, wavFileChunks } = require('../src/audio/wav');
 const { transcriptionUrl, retryableStatus, mergeOverlap } = require('../src/services/transcription');
 const { canAccessDevice } = require('../src/middleware/auth');
-const { processCallAudio } = require('../src/services/audioProcessing');
+const { filterFor, processCallAudio } = require('../src/services/audioProcessing');
+const { listen } = require('../src/index');
 
 test.after(() => {
     if (fs.existsSync(process.env.CALL_STORAGE_DIR)) fs.rmSync(process.env.CALL_STORAGE_DIR, { recursive: true });
+});
+
+test('a second backend rejects an occupied HTTP port before starting workers', async () => {
+    const occupied = http.createServer();
+    await new Promise(resolve => occupied.listen(0, '127.0.0.1', resolve));
+    const port = occupied.address().port;
+    const app = { listen: candidatePort => http.createServer().listen(candidatePort, '127.0.0.1') };
+    try {
+        await assert.rejects(() => listen(app, port), error => error.code === 'EADDRINUSE');
+    } finally {
+        await new Promise(resolve => occupied.close(resolve));
+    }
 });
 
 test('PCM keeps an odd trailing byte and never mixes adjacent samples', () => {
@@ -52,6 +66,80 @@ test('ffmpeg performs real 8k to 16k resampling while preserving duration', asyn
         fs.writeFileSync(original, Buffer.concat([wavHeader(pcm.length, 8000), pcm]));
         const result = await processCallAudio({ id: `test-${process.pid}`, original_path: original, input_sample_rate: 8000, output_sample_rate: 16000, audio_profile: 'mild' });
         assert.equal(result.quality.original.sampleRate, 8000);
+        assert.equal(result.quality.processed.sampleRate, 16000);
+        assert.ok(Math.abs(result.quality.processed.durationMs - 1000) < 2);
+        if (fs.existsSync(result.outputPath)) fs.unlinkSync(result.outputPath);
+    } finally { fs.rmSync(dir, { recursive: true }); }
+});
+
+test('mild speech processing raises quiet speech without clipping', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'simcard-enhance-'));
+    const original = path.join(dir, 'input.wav');
+    try {
+        const rate = 8000;
+        const pcm = Buffer.alloc(rate * 4);
+        for (let i = 0; i < pcm.length / 2; i++) {
+            const speech = 350 * Math.sin(i * 2 * Math.PI * 440 / rate);
+            const hum = 180 * Math.sin(i * 2 * Math.PI * 50 / rate);
+            pcm.writeInt16LE(Math.round(speech + hum), i * 2);
+        }
+        fs.writeFileSync(original, Buffer.concat([wavHeader(pcm.length, rate), pcm]));
+        const before = audioStatsFile(original);
+        const result = await processCallAudio({ id: `enhance-${process.pid}`, original_path: original,
+            input_sample_rate: rate, output_sample_rate: 16000, audio_profile: 'mild' });
+        const after = audioStatsFile(result.outputPath);
+        assert.equal(after.sampleRate, 16000);
+        assert.ok(after.rms > before.rms * 2, `expected useful speech gain, got ${before.rms} -> ${after.rms}`);
+        assert.ok(after.peak < 32768, 'processed audio must retain true-peak headroom');
+        if (fs.existsSync(result.outputPath)) fs.unlinkSync(result.outputPath);
+    } finally { fs.rmSync(dir, { recursive: true }); }
+});
+
+test('strong processing repairs impulses and emphasizes speech presence', async () => {
+    const filter = filterFor('strong', 16000);
+    assert.match(filter, /^aresample=16000,/);
+    assert.match(filter, /adeclick=/);
+    assert.match(filter, /afftdn=/);
+    assert.match(filter, /equalizer=f=1800/);
+    assert.match(filter, /loudnorm=/);
+    assert.throws(() => filterFor('strong', '16000,volume=10'), /Unsupported output sample rate/);
+    const highSignalFilter = filterFor('strong', 16000, { rms: 2200, peak: 30000 });
+    assert.match(highSignalFilter, /afftdn=nr=10/);
+    assert.doesNotMatch(highSignalFilter, /anlmdn=/);
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'simcard-strong-'));
+    const original = path.join(dir, 'input.wav');
+    try {
+        const rate = 8000;
+        const pcm = Buffer.alloc(rate * 4 * 2);
+        for (let i = 0; i < pcm.length / 2; i++) {
+            const speech = 600 * Math.sin(i * 2 * Math.PI * 1800 / rate);
+            const click = i % 997 === 0 ? 26000 : 0;
+            pcm.writeInt16LE(Math.round(speech + click), i * 2);
+        }
+        fs.writeFileSync(original, Buffer.concat([wavHeader(pcm.length, rate), pcm]));
+        const result = await processCallAudio({ id: `strong-${process.pid}`, original_path: original,
+            input_sample_rate: rate, output_sample_rate: 16000, audio_profile: 'strong' });
+        assert.equal(result.quality.processed.sampleRate, 16000);
+        assert.ok(result.quality.processed.rms > result.quality.original.rms,
+            'strong processing should make quiet speech easier to hear');
+        assert.ok(result.quality.processed.peak < 32768, 'strong output must not clip');
+        if (fs.existsSync(result.outputPath)) fs.unlinkSync(result.outputPath);
+    } finally { fs.rmSync(dir, { recursive: true }); }
+});
+
+test('strong processing accepts supported high-rate input without crashing ffmpeg', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'simcard-high-rate-'));
+    const original = path.join(dir, 'input.wav');
+    try {
+        const rate = 48000;
+        const pcm = Buffer.alloc(rate * 2);
+        for (let i = 0; i < pcm.length / 2; i++) {
+            pcm.writeInt16LE(Math.round(900 * Math.sin(i * 2 * Math.PI * 1200 / rate)), i * 2);
+        }
+        fs.writeFileSync(original, Buffer.concat([wavHeader(pcm.length, rate), pcm]));
+        const result = await processCallAudio({ id: `high-rate-${process.pid}`, original_path: original,
+            input_sample_rate: rate, output_sample_rate: 16000, audio_profile: 'strong' });
         assert.equal(result.quality.processed.sampleRate, 16000);
         assert.ok(Math.abs(result.quality.processed.durationMs - 1000) < 2);
         if (fs.existsSync(result.outputPath)) fs.unlinkSync(result.outputPath);

@@ -40,7 +40,7 @@ function DeviceSettings({ device, onSave }) {
     <label>نرخ ورودی<input className="form-input" type="number" placeholder="اعلام firmware" value={form.input_sample_rate} onChange={e => setForm({ ...form, input_sample_rate: e.target.value })}/></label>
     <label className="check-label"><input type="checkbox" checked={form.experimental_calibration} onChange={e => setForm({ ...form, experimental_calibration: e.target.checked })}/> کالیبراسیون آزمایشی</label>
     <label>نرخ خروجی<select className="form-input" value={form.output_sample_rate} onChange={e => setForm({ ...form, output_sample_rate: Number(e.target.value) })}>{[8000,16000,24000,32000,48000].map(rate => <option key={rate}>{rate}</option>)}</select></label>
-    <label>پروفایل<select className="form-input" value={form.audio_profile} onChange={e => setForm({ ...form, audio_profile: e.target.value })}><option value="raw">خام</option><option value="mild">ملایم</option><option value="strong">قوی</option></select></label>
+    <label>پروفایل<select className="form-input" value={form.audio_profile} onChange={e => setForm({ ...form, audio_profile: e.target.value })}><option value="raw">خام (بدون حذف نویز)</option><option value="mild">شفاف‌سازی متعادل</option><option value="strong">شفاف‌سازی قوی</option></select></label>
     <label className="check-label"><input type="checkbox" checked={form.active} onChange={e => setForm({ ...form, active: e.target.checked })}/> receiver فعال</label><button className="btn btn-secondary">ذخیره</button>
   </form>;
 }

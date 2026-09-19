@@ -1,0 +1,16 @@
+#pragma once
+
+// Copy this file to config.local.h and edit. config.local.h is gitignored.
+
+// #define WIFI_SSID "Otaq"
+// #define WIFI_PASS "Pour1412#"
+
+// #define USE_STATIC_IP 1
+// #define STATIC_IP_D 202
+
+// #define EITAA_GATEWAY_URL "http://gateway.irm/send"
+// #define ACCOUNT_MANAGER_URL "http://10.10.20.51:8085"
+// #define ACCOUNT_MANAGER_API_KEY ""
+
+// Force a number if AT+CNUM is empty:
+// #define PHONE_NUMBER "989121234567"

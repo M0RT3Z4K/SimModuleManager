@@ -12,7 +12,14 @@
 #define DEVICE_REGISTRATION_TOKEN ""
 #endif
 #ifndef AUDIO_OUTPUT_SAMPLE_RATE
-#define AUDIO_OUTPUT_SAMPLE_RATE 8000
+#define AUDIO_OUTPUT_SAMPLE_RATE 48000
 #endif
 static_assert(AUDIO_OUTPUT_SAMPLE_RATE == 8000 || AUDIO_OUTPUT_SAMPLE_RATE == 16000,
               "Audio output must use a supported telephony rate");
+#ifndef MODEM_SPEAKER_LEVEL
+// Raise the modem signal before the ESP32 ADC. This improves signal-to-noise
+// ratio more effectively than applying large digital gain to a quiet capture.
+#define MODEM_SPEAKER_LEVEL 100
+#endif
+static_assert(MODEM_SPEAKER_LEVEL >= 0 && MODEM_SPEAKER_LEVEL <= 100,
+              "SIM800 speaker level must be between 0 and 100");

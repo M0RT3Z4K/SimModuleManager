@@ -3,3 +3,5 @@
 // Same registration credential as DEVICE_REGISTRATION_TOKEN in the backend.
 #define DEVICE_REGISTRATION_TOKEN "REPLACE_WITH_PANEL_REGISTRATION_TOKEN"
 #define AUDIO_OUTPUT_SAMPLE_RATE 8000
+// Reduce this if real speech (not only call-start clicks) clips at the ADC.
+#define MODEM_SPEAKER_LEVEL 50

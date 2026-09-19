@@ -37,13 +37,35 @@ function createApp(prisma) {
     return app;
 }
 
+function listen(app, port) {
+    return new Promise((resolve, reject) => {
+        const server = app.listen(port);
+        const onError = error => reject(error);
+        server.once('error', onError);
+        server.once('listening', () => {
+            server.off('error', onError);
+            console.log(`Backend server listening on port ${port}`);
+            resolve(server);
+        });
+    });
+}
+
 async function start() {
     ensureStorage();
     const prisma = new PrismaClient();
     await prisma.$connect();
     const app = createApp(prisma);
     const port = process.env.PORT || 3001;
-    const server = app.listen(port, () => console.log(`Backend server listening on port ${port}`));
+    let server;
+    try {
+        // Do not start receiver/job daemons unless this process owns the HTTP
+        // port. Otherwise an old server and a new background worker can process
+        // the same audio using different in-memory processing versions.
+        server = await listen(app, port);
+    } catch (error) {
+        await prisma.$disconnect();
+        throw error;
+    }
     const receiver = new ReceiverManager(prisma);
     const jobs = new JobWorker(prisma);
     const health = startHealthCheckDaemon(prisma);
@@ -65,4 +87,4 @@ async function start() {
 
 if (require.main === module) start().catch(error => { console.error(error); process.exitCode = 1; });
 
-module.exports = { createApp, start };
+module.exports = { createApp, listen, start };

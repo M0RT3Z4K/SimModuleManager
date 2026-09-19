@@ -91,8 +91,10 @@ The firmware must use one shared AT line parser/dispatcher for command responses
 ## Audio profiles
 
 - `raw`: declared-rate PCM converted to a standard WAV and resampled only when required.
-- `mild` (default): soft 100–3800 Hz speech band, conservative adaptive spectral reduction, smoothed gain control with capped gain, and real resampling.
-- `strong`: narrower 120–3600 Hz band and stronger reduction/gain; opt-in because it can damage weak consonants.
+- `mild` (default): audio is first normalized to a stable 16 kHz processing rate, then a 120–3600 Hz speech band, conservative adaptive spectral/non-local-means reduction, a light 2 kHz presence lift, capped speech normalization, true-peak-safe loudness normalization, and real output resampling are applied.
+- `strong`: adapts to the captured level. Quiet captures get the two-stage reduction; hot captures use lighter spectral reduction without NLM so consonants are not replaced by metallic/musical artifacts. Both paths repair short analog clicks, preserve the telephone speech band, lift speech presence, and apply capped loudness normalization.
+
+The firmware defaults the SIM800 analog speaker output to `AT+CLVL=50` (override with `MODEM_SPEAKER_LEVEL`). It also applies a fourth-order anti-alias low-pass filter before clock-based decimation; this prevents out-of-band ADC/modem noise from folding into the speech band. Raising the useful signal before the ESP32 ADC improves SNR, but backend gain cannot recover clipped or aliased detail. Short call-state clicks are handled separately by the strong backend profile.
 
 The original file is never overwritten. All-zero or near-zero recordings are marked `no_signal` and are not sent for transcription. No text, confidence, speaker identity, summary, or translation is invented. The modem loudspeaker output is not claimed to contain both parties and is not claimed to support diarization.
 
