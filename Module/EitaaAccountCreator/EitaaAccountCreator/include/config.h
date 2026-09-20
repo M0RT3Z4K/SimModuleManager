@@ -1,6 +1,6 @@
 #pragma once
 
-// Optional local overrides (WiFi, static IP, URLs). Copy from config.local.h.example.
+// Optional local overrides (WiFi, IP mode, URLs). Copy from config.local.h.example.
 #if __has_include("config.local.h")
 #include "config.local.h"
 #endif
@@ -14,19 +14,18 @@
 #endif
 
 #ifndef USE_STATIC_IP
-#define USE_STATIC_IP 1
+#define USE_STATIC_IP 0
 #endif
 #ifndef STATIC_IP_A
 #define STATIC_IP_A 10
 #define STATIC_IP_B 10
 #define STATIC_IP_C 30
-#define STATIC_IP_D 202
+#define STATIC_IP_D 204
 #endif
 #ifndef GATEWAY_IP_D
 #define GATEWAY_IP_D 1
 #endif
 
-// Local DNS first so gateway.irm resolves on this network.
 #ifndef DNS_PRIMARY_A
 #define DNS_PRIMARY_A 10
 #define DNS_PRIMARY_B 10
@@ -75,5 +74,5 @@
 #define MIN_CSQ_RSSI 5
 #endif
 #ifndef SEND_CODE_RETRIES
-#define SEND_CODE_RETRIES 3
+#define SEND_CODE_RETRIES 1
 #endif

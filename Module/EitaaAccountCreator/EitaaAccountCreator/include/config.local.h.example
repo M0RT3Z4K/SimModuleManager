@@ -5,8 +5,10 @@
 // #define WIFI_SSID "Otaq"
 // #define WIFI_PASS "Pour1412#"
 
+// Default is DHCP. To use a static IP instead, uncomment these:
 // #define USE_STATIC_IP 1
-// #define STATIC_IP_D 202
+// #define STATIC_IP_C 30
+// #define STATIC_IP_D 201
 
 // #define EITAA_GATEWAY_URL "http://gateway.irm/send"
 // #define ACCOUNT_MANAGER_URL "http://10.10.20.51:8085"

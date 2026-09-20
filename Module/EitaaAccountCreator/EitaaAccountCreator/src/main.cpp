@@ -33,7 +33,7 @@
 #define MODEM_DTR       32
 #define I2C_SDA         21
 #define I2C_SCL         22
-#define LED_GPIO        13
+#define LED_GPIO        13  // AM036 / T-Call: blue user LED. Red LED is SIM800 NETLIGHT.
 
 #define IP5306_ADDR         0x75
 #define IP5306_REG_SYS_CTL0 0x00
@@ -47,6 +47,7 @@ enum RunState {
     ST_WAIT_NET,
     ST_WAIT_PHONE,
     ST_WAIT_WIFI,
+    ST_WAIT_FLOOD,
     ST_SEND_CODE,
     ST_WAIT_SMS,
     ST_SIGN_IN,
@@ -62,6 +63,7 @@ static const char* stateName(RunState s) {
         case ST_WAIT_NET:     return "wait_net";
         case ST_WAIT_PHONE:   return "wait_phone";
         case ST_WAIT_WIFI:    return "wait_wifi";
+        case ST_WAIT_FLOOD:   return "wait_flood";
         case ST_SEND_CODE:    return "send_code";
         case ST_WAIT_SMS:     return "wait_sms";
         case ST_SIGN_IN:      return "sign_in";
@@ -99,6 +101,8 @@ static bool ledOn = false;
 static int sendCodeAttempts = 0;
 static int lastCsq = -1;
 static int lastCreg = -1;
+static unsigned long floodUntilMs = 0;
+static unsigned long lastFloodLog = 0;
 
 static const char* kFirstNames[] = {
     "علی", "محمد", "حسین", "رضا", "مهدی", "امیر", "حسن", "سعید", "جواد", "حامد"
@@ -110,19 +114,31 @@ static const char* kLastNames[] = {
 void processModemLine(const String& line);
 String sendAT(const String& cmd, unsigned long timeout = 2000, bool trimResponse = true);
 String readIccid();
+void setLed(bool on);
 
 /* -------------------------------------------------------------------------
  * Helpers
  * ------------------------------------------------------------------------- */
 
+void applyErrorLeds() {
+    // AM036 has no RGB: hide the blue GPIO13 LED so the red NETLIGHT is the error color.
+    setLed(false);
+    sendAT("AT+CNETLIGHT=1", 800, true);
+}
+
 void enterState(RunState next) {
     state = next;
     stateEnteredAt = millis();
-    if (next == ST_ERROR && lastError.length()) {
-        SerialMon.printf("[STATE] error: %s\n", lastError.c_str());
-    } else {
-        SerialMon.printf("[STATE] %s\n", stateName(next));
+    if (next == ST_ERROR) {
+        applyErrorLeds();
+        if (lastError.length()) {
+            SerialMon.printf("[STATE] error: %s  (LED قرمز NETLIGHT)\n", lastError.c_str());
+        } else {
+            SerialMon.println("[STATE] error  (LED قرمز NETLIGHT)");
+        }
+        return;
     }
+    SerialMon.printf("[STATE] %s\n", stateName(next));
 }
 
 String digitsOnly(const String& in) {
@@ -249,12 +265,17 @@ String extractOtp(const String& text) {
 }
 
 String randomImei() {
+    // Same as Account-Manager-Dashboard / BulkPvSender: 15 alphanum + "__web".
+    // Numeric / suffix-less IMEIs go down the native-client path; Eitaa rate-limits
+    // that bucket hard on first-time (unoccupied) numbers, while __web stays on the
+    // same flood bucket as a manual dashboard sendCode.
     static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz0123456789";
     String out;
-    out.reserve(15);
+    out.reserve(21);
     for (int i = 0; i < 15; ++i) {
         out += alphabet[esp_random() % (sizeof(alphabet) - 1)];
     }
+    out += "__web";
     return out;
 }
 
@@ -361,15 +382,22 @@ void setLed(bool on) {
 }
 
 void serviceLed() {
-    unsigned long interval = 800;
+    // Error: keep blue off so the board reads as red (SIM800 NETLIGHT).
+    if (state == ST_ERROR) {
+        setLed(false);
+        return;
+    }
+    if (state == ST_DONE) {
+        setLed(true);
+        return;
+    }
+    unsigned long interval = 500;
     switch (state) {
-        case ST_DONE: setLed(true); return;
-        case ST_ERROR: interval = 120; break;
         case ST_WAIT_SMS:
         case ST_SIGN_IN:
         case ST_SIGN_UP:
         case ST_REGISTER_AM: interval = 180; break;
-        case ST_WAIT_SIM: interval = 1400; break;
+        case ST_WAIT_FLOOD: interval = 250; break;
         default: interval = 500; break;
     }
     if (millis() - lastLedToggle < interval) return;
@@ -548,21 +576,28 @@ void clearSmsInbox() {
 bool postJson(const String& url, const String& body, String& response, int& status) {
     response = "";
     status = -1;
+    lastError = "";
+    if (WiFi.status() != WL_CONNECTED) {
+        lastError = "wifi not connected";
+        return false;
+    }
+
     HTTPClient http;
     http.setConnectTimeout(12000);
     http.setTimeout(60000);
     http.setReuse(false);
 
+    WiFiClient client;
     WiFiClientSecure secure;
     bool began = false;
     if (url.startsWith("https://")) {
         secure.setInsecure();
         began = http.begin(secure, url);
     } else {
-        began = http.begin(url);
+        began = http.begin(client, url);
     }
     if (!began) {
-        lastError = "http begin failed";
+        lastError = String("http begin failed url=") + url;
         return false;
     }
 
@@ -575,9 +610,15 @@ bool postJson(const String& url, const String& body, String& response, int& stat
     }
 
     status = http.POST(body);
+    if (status <= 0) {
+        lastError = String("HTTP ") + String(status) + " " + http.errorToString(status)
+            + " url=" + url + " ip=" + WiFi.localIP().toString();
+        http.end();
+        return false;
+    }
     response = http.getString();
     http.end();
-    return status > 0;
+    return true;
 }
 
 bool parseObject(const String& json, DynamicJsonDocument& doc) {
@@ -683,10 +724,14 @@ bool sendCode() {
     DynamicJsonDocument req(1024);
     JsonObject param = req.createNestedObject("p");
     param["phone_number"] = phone;
-    param["api_id"] = EITAA_API_ID;
-    param["api_hash"] = EITAA_API_HASH;
+    // Dashboard/Bruno send api_id=0 + empty hash so the gateway fills production
+    // defaults. Sending 1782360 with current_number=true is the native-app path
+    // that FLOOD_WAIT's unoccupied numbers.
+    param["api_id"] = 0;
+    param["api_hash"] = "";
     JsonObject settings = param.createNestedObject("settings");
     settings["_"] = "codeSettings";
+    settings["flags"] = 0;
 
     DynamicJsonDocument out(4096);
     String ctor;
@@ -704,31 +749,36 @@ bool sendCode() {
     }
     String codeType;
     if (out["type"].is<JsonObject>()) codeType = out["type"]["_"] | "";
-    SerialMon.printf("[EITAA] کد ارسال شد type=%s hash=%s\n",
-                     codeType.c_str(), maskSecret(phoneCodeHash).c_str());
-    if (codeType.length() && codeType.indexOf("Sms") < 0 && codeType.indexOf("sms") < 0) {
-        SerialMon.printf("[EITAA] نوع %s است؛ resend برای SMS\n", codeType.c_str());
-        delay(1200);
-        DynamicJsonDocument req2(1024);
-        JsonObject p2 = req2.createNestedObject("p");
-        p2["phone_number"] = phone;
-        p2["phone_code_hash"] = phoneCodeHash;
-        DynamicJsonDocument out2(4096);
-        String ctor2;
-        JsonObject rp = req2["p"].as<JsonObject>();
-        if (gatewayCall("auth.resendCode", rp, out2, ctor2) && ctor2 == "auth.sentCode") {
-            String nextHash = out2["phone_code_hash"] | "";
-            nextHash.trim();
-            if (nextHash.length()) phoneCodeHash = nextHash;
-            String nextType;
-            if (out2["type"].is<JsonObject>()) nextType = out2["type"]["_"] | "";
-            SerialMon.printf("[EITAA] resend type=%s hash=%s\n",
-                             nextType.c_str(), maskSecret(phoneCodeHash).c_str());
-        } else {
-            SerialMon.printf("[EITAA] resend لازم نبود/ناموفق: %s\n", lastError.c_str());
-            lastError = "";
-        }
+    String nextType;
+    if (out["next_type"].is<JsonObject>()) nextType = out["next_type"]["_"] | "";
+    int timeout = out["timeout"] | 0;
+    SerialMon.printf("[EITAA] کد ارسال شد type=%s next=%s timeout=%d hash=%s — منتظر SMS\n",
+                     codeType.c_str(), nextType.c_str(), timeout,
+                     maskSecret(phoneCodeHash).c_str());
+    return true;
+}
+
+bool resendLoginCode() {
+    if (!phone.length() || !phoneCodeHash.length()) return false;
+    DynamicJsonDocument req(1024);
+    JsonObject param = req.createNestedObject("p");
+    param["phone_number"] = phone;
+    param["phone_code_hash"] = phoneCodeHash;
+    DynamicJsonDocument out(4096);
+    String ctor;
+    JsonObject p = req["p"].as<JsonObject>();
+    if (!gatewayCall("auth.resendCode", p, out, ctor)) return false;
+    if (ctor != "auth.sentCode") {
+        lastError = "unexpected resendCode constructor: " + ctor;
+        return false;
     }
+    String nextHash = out["phone_code_hash"] | "";
+    nextHash.trim();
+    if (nextHash.length()) phoneCodeHash = nextHash;
+    String nextType;
+    if (out["type"].is<JsonObject>()) nextType = out["type"]["_"] | "";
+    SerialMon.printf("[EITAA] resend type=%s hash=%s\n",
+                     nextType.c_str(), maskSecret(phoneCodeHash).c_str());
     return true;
 }
 
@@ -777,6 +827,30 @@ bool errorIs(const String& hay, const char* needle) {
     String h = hay;
     h.toUpperCase();
     return h.indexOf(needle) >= 0;
+}
+
+int parseFloodWaitSeconds(const String& err) {
+    String u = err;
+    u.toUpperCase();
+    int i = u.indexOf("FLOOD_WAIT_");
+    if (i >= 0) {
+        int n = u.substring(i + 11).toInt();
+        if (n > 0) return n;
+    }
+    if (u.indexOf("FLOOD") >= 0) return 60;
+    return 0;
+}
+
+void armFloodWait(const String& err) {
+    int sec = parseFloodWaitSeconds(err);
+    if (sec <= 0) sec = 60;
+    if (sec > 3600) sec = 3600;
+    floodUntilMs = millis() + (unsigned long)(sec + 3) * 1000UL;
+    SerialMon.printf("[EITAA] FloodWait %d ثانیه — تا تمام نشود sendCode نمی‌زنیم\n", sec);
+}
+
+bool floodActive() {
+    return floodUntilMs != 0 && (long)(millis() - floodUntilMs) < 0;
 }
 
 bool registerAccountManager() {
@@ -953,6 +1027,8 @@ void serviceSerial() {
 
 void connectWifi() {
     if (WiFi.status() == WL_CONNECTED) return;
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
 #if USE_STATIC_IP
     IPAddress local(STATIC_IP_A, STATIC_IP_B, STATIC_IP_C, STATIC_IP_D);
     IPAddress gw(STATIC_IP_A, STATIC_IP_B, STATIC_IP_C, GATEWAY_IP_D);
@@ -961,10 +1037,12 @@ void connectWifi() {
     IPAddress dns2(8, 8, 8, 8);
     if (!WiFi.config(local, gw, mask, dns1, dns2)) {
         SerialMon.println("[WIFI] static IP failed; DHCP");
+    } else {
+        SerialMon.printf("[WIFI] static %s gw %s\n", local.toString().c_str(), gw.toString().c_str());
     }
+#else
+    SerialMon.println("[WIFI] DHCP");
 #endif
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
 }
 
@@ -1076,11 +1154,25 @@ void loop() {
 
         case ST_WAIT_WIFI:
             if (WiFi.status() == WL_CONNECTED) {
-                SerialMon.printf("[WIFI] %s\n", WiFi.localIP().toString().c_str());
+                SerialMon.printf("[WIFI] %s -> %s\n", WiFi.localIP().toString().c_str(), EITAA_GATEWAY_URL);
                 enterState(sessionToken.length() ? ST_REGISTER_AM : ST_SEND_CODE);
             } else if (millis() - stateEnteredAt > 45000) {
                 lastError = "wifi timeout";
                 enterState(ST_ERROR);
+            }
+            break;
+
+        case ST_WAIT_FLOOD:
+            if (!pollSimStillPresent()) break;
+            if (!floodActive()) {
+                SerialMon.println("[EITAA] FloodWait تمام شد");
+                enterState(ST_SEND_CODE);
+                break;
+            }
+            if (millis() - lastFloodLog > 5000) {
+                lastFloodLog = millis();
+                unsigned long left = (floodUntilMs - millis()) / 1000UL;
+                SerialMon.printf("[EITAA] صبر فیلود %lu ثانیه مانده\n", left);
             }
             break;
 
@@ -1089,7 +1181,11 @@ void loop() {
                 enterState(ST_WAIT_WIFI);
                 break;
             }
-            sessionImei = randomImei();
+            if (floodActive()) {
+                enterState(ST_WAIT_FLOOD);
+                break;
+            }
+            if (!sessionImei.length()) sessionImei = randomImei();
             pickSignupName();
             pendingSms = false;
             pendingSmsText = "";
@@ -1100,9 +1196,9 @@ void loop() {
                              firstName.c_str(), lastName.c_str());
             if (!sendCode()) {
                 SerialMon.printf("[EITAA] sendCode failed: %s\n", lastError.c_str());
-                if (errorIs(lastError, "FLOOD") && sendCodeAttempts < SEND_CODE_RETRIES) {
-                    SerialMon.println("[EITAA] flood — ۳۰ ثانیه صبر");
-                    delay(30000);
+                if (errorIs(lastError, "FLOOD")) {
+                    armFloodWait(lastError);
+                    enterState(ST_WAIT_FLOOD);
                     break;
                 }
                 enterState(ST_ERROR);
@@ -1212,6 +1308,7 @@ void loop() {
 
         case ST_ERROR:
             if (!pollSimStillPresent()) break;
+            if (errorIs(lastError, "FLOOD")) break;
             if (millis() - stateEnteredAt > 15000 && sendCodeAttempts < SEND_CODE_RETRIES
                 && phoneCodeHash.length() == 0) {
                 SerialMon.println("[ERROR] تلاش دوباره sendCode");
