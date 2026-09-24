@@ -1,0 +1,30 @@
+services:
+  gateway:
+    build: .
+    container_name: eitaa-gateway
+    restart: unless-stopped
+    environment:
+      IPC_SOCKET: /tmp/eitaa_service.sock
+      SPECS_PATH: /app/specs.json
+      RUST_LOG: info
+      GATEWAY_WORKERS: 4
+    volumes:
+      # Expose the Unix socket to the host so external clients
+      # (account-manager, test scripts) can connect.
+      - gateway-sock:/tmp
+      # Keep the test scripts and assets available inside the container (for
+      # running tests via `docker compose run gateway ...`).
+      - ./tests:/app/tests:ro
+      - ./test_send_code.py:/app/test_send_code.py:ro
+      - ./test_media_flow.py:/app/test_media_flow.py:ro
+      - ./gateway_resilience.py:/app/gateway_resilience.py:ro
+      - ./hero-profile.jpg:/app/hero-profile.jpg:ro
+    networks:
+      - gateway-net
+
+volumes:
+  gateway-sock:
+
+networks:
+  gateway-net:
+    driver: bridge

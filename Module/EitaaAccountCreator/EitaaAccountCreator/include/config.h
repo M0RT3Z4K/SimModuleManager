@@ -5,7 +5,33 @@
 #include "config.local.h"
 #endif
 
-// --- WiFi (same LAN as the other TTGO T-Call in SimcardManager) ---
+// Transport (pick one):
+//   USE_PHONE_HOTSPOT     — WiFi to the phone, onboard TL gateway (direct Eitaa)
+//   USE_INTERNAL_NETWORK  — office LAN (Otaq + 10.10.20.51)
+//   both 0                — SIM GPRS
+#ifndef USE_PHONE_HOTSPOT
+#define USE_PHONE_HOTSPOT 1
+#endif
+#ifndef USE_INTERNAL_NETWORK
+#define USE_INTERNAL_NETWORK 0
+#endif
+
+#if USE_PHONE_HOTSPOT
+#define USE_WIFI_TRANSPORT 1
+#elif USE_INTERNAL_NETWORK
+#define USE_WIFI_TRANSPORT 1
+#else
+#define USE_WIFI_TRANSPORT 0
+#endif
+
+#ifndef HOTSPOT_SSID
+#define HOTSPOT_SSID "reza"
+#endif
+#ifndef HOTSPOT_PASS
+#define HOTSPOT_PASS "12345678"
+#endif
+
+// --- Office WiFi (only when USE_INTERNAL_NETWORK) ---
 #ifndef WIFI_SSID
 #define WIFI_SSID "Otaq"
 #endif
@@ -33,9 +59,26 @@
 #define DNS_PRIMARY_D 1
 #endif
 
-// --- Eitaa Gateway (MCP: http://gateway.irm/send) ---
+#ifndef GPRS_APN
+#define GPRS_APN ""
+#endif
+#ifndef GPRS_USER
+#define GPRS_USER ""
+#endif
+#ifndef GPRS_PASS
+#define GPRS_PASS ""
+#endif
+#ifndef GPRS_WAIT_MS
+#define GPRS_WAIT_MS 90000
+#endif
+
+// --- Eitaa Gateway ---
 #ifndef EITAA_GATEWAY_URL
+#if USE_INTERNAL_NETWORK
 #define EITAA_GATEWAY_URL "http://10.10.20.51:3000/send"
+#else
+#define EITAA_GATEWAY_URL "https://gateway.ir-ma.ir/send"
+#endif
 #endif
 #ifndef EITAA_API_ID
 #define EITAA_API_ID 1782360
@@ -44,9 +87,12 @@
 #define EITAA_API_HASH "0d870902a3e09e7cdc57e5d7bd68da6b"
 #endif
 
-// --- Account Manager (MCP: POST /accounts on http://10.10.20.51:8085) ---
 #ifndef ACCOUNT_MANAGER_URL
+#if USE_INTERNAL_NETWORK
 #define ACCOUNT_MANAGER_URL "http://10.10.20.51:8085"
+#else
+#define ACCOUNT_MANAGER_URL "https://account-manager.ir-ma.ir"
+#endif
 #endif
 #ifndef ACCOUNT_MANAGER_API_KEY
 #define ACCOUNT_MANAGER_API_KEY ""
@@ -65,7 +111,7 @@
 #endif
 
 #ifndef SMS_WAIT_MS
-#define SMS_WAIT_MS 120000
+#define SMS_WAIT_MS 600000
 #endif
 #ifndef NETWORK_WAIT_MS
 #define NETWORK_WAIT_MS 90000
@@ -75,4 +121,10 @@
 #endif
 #ifndef SEND_CODE_RETRIES
 #define SEND_CODE_RETRIES 1
+#endif
+
+// 1 = talk to Eitaa hosts directly (hasan.eitaa.ir …) with the Rust TL wrapper.
+// 0 = JSON through EITAA_GATEWAY_URL (your server IP — Eitaa rate-limits that).
+#ifndef USE_DIRECT_EITAA
+#define USE_DIRECT_EITAA 1
 #endif

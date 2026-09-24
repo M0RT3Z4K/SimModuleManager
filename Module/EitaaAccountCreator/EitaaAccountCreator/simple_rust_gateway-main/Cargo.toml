@@ -1,0 +1,69 @@
+[package]
+name = "simple_rust_gateway"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "eitaa_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "eitaa-gateway"
+path = "src/main.rs"
+
+[features]
+default = []          # or whatever you want
+http = []             # define the `http` feature
+
+[dependencies]
+actix-web = "4.13.0"
+axum = "0.8.8"
+http = "1.4.0"
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+serde = { version = "1.0.228",features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+tower-http = { version = "0.5", features = ["cors", "trace", "timeout"] }
+tracing = "0.1.44"
+anyhow = "1.0.102"
+dotenvy = "0.15.7"
+tokio = { version = "1.50.0", features = ["full"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter","fmt"] }
+flate2 = "1.1.9"
+config = "0.15.22"
+rand = "0.10.0"
+ahash             = "0.8"
+
+[dev-dependencies]
+futures = "0.3.32"
+tokio-test = "0.4.5"
+
+#tokio = { version = "1", features = ["full"] }
+#
+## serde + serde_json: Convert Rust structs ↔ JSON
+## "derive" means we can write #[derive(Serialize, Deserialize)] on structs
+#serde      = { version = "1", features = ["derive"] }
+#serde_json = "1"
+#
+## reqwest: HTTP client (like Python's requests library)
+## We use rustls-tls (pure-Rust TLS) instead of system OpenSSL for portability
+#reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+#
+## thiserror: Makes defining custom error types much easier
+#thiserror = "1"
+#
+## tracing + tracing-subscriber: Structured logging (like Python's logging module)
+#tracing            = "0.1"
+#tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+#
+## flate2: Gzip compression/decompression (used by Eitaa's binary protocol)
+#flate2 = "1"
+#
+## rand: Random number generation (we need random file_id values)
+#rand = "0.8"
+#
+## anyhow: Easy error handling in main() — converts any error type
+#anyhow = "1"
+#
+## dotenvy: Load .env files (like python-dotenv)
+#dotenvy = "0.15"

@@ -9,6 +9,15 @@
 #include <esp_system.h>
 #include "config.h"
 #include "sim_directory.h"
+#include "eitaa_tl.h"
+#if !USE_WIFI_TRANSPORT
+#include <TinyGsmClient.h>
+#include "mbedtls/ssl.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/error.h"
+#include "mbedtls/net_sockets.h"
+#endif
 
 /* =========================================================================
  * TTGO T-Call (ESP32 + SIM800L) — Eitaa account creator
@@ -16,9 +25,9 @@
  * Wait for SIM → wait for network → auth.sendCode → read SMS code →
  * auth.signIn → if new number, auth.signUp → POST Account Manager /accounts
  *
- * Gateway envelope (same as Account-Manager-Dashboard/lib/eitaa-auth.ts):
- *   POST {EITAA_GATEWAY_URL}
- *   {"method","param","token","imei"}   token is empty before login
+ * Auth (USE_DIRECT_EITAA): TL-serialize like simple_rust_gateway and POST
+ *   the eitaaObject binary to https://hasan.eitaa.ir/eitaa/.
+ * Transport: phone hotspot (reza) / office WiFi / SIM GPRS.
  *
  * Account Manager (MCP create_account):
  *   POST {ACCOUNT_MANAGER_URL}/accounts
@@ -40,6 +49,11 @@
 
 #define SerialMon Serial
 HardwareSerial SerialAT(1);
+#if !USE_WIFI_TRANSPORT
+TinyGsm modem(SerialAT);
+TinyGsmClient gsmTcp(modem);
+#endif
+SET_LOOP_TASK_STACK_SIZE(32768);
 WebServer httpServer(80);
 
 enum RunState {
@@ -47,6 +61,7 @@ enum RunState {
     ST_WAIT_NET,
     ST_WAIT_PHONE,
     ST_WAIT_WIFI,
+    ST_WAIT_GPRS,
     ST_WAIT_FLOOD,
     ST_SEND_CODE,
     ST_WAIT_SMS,
@@ -63,6 +78,7 @@ static const char* stateName(RunState s) {
         case ST_WAIT_NET:     return "wait_net";
         case ST_WAIT_PHONE:   return "wait_phone";
         case ST_WAIT_WIFI:    return "wait_wifi";
+        case ST_WAIT_GPRS:    return "wait_gprs";
         case ST_WAIT_FLOOD:   return "wait_flood";
         case ST_SEND_CODE:    return "send_code";
         case ST_WAIT_SMS:     return "wait_sms";
@@ -99,22 +115,36 @@ static unsigned long lastSmsPoll = 0;
 static unsigned long lastLedToggle = 0;
 static bool ledOn = false;
 static int sendCodeAttempts = 0;
+static bool sendCodePosted = false;
 static int lastCsq = -1;
 static int lastCreg = -1;
 static unsigned long floodUntilMs = 0;
 static unsigned long lastFloodLog = 0;
+static bool gprsReady = false;
+static String gprsIp;
+static String gprsApn;
 
 static const char* kFirstNames[] = {
-    "علی", "محمد", "حسین", "رضا", "مهدی", "امیر", "حسن", "سعید", "جواد", "حامد"
+    "Ali", "Mohammad", "Hossein", "Reza", "Mehdi", "Amir", "Hassan", "Saeed", "Javad", "Hamed"
 };
 static const char* kLastNames[] = {
-    "محمدی", "حسینی", "رضایی", "کریمی", "موسوی", "جعفری", "احمدی", "نوری", "صادقی", "کاظمی"
+    "Mohammadi", "Hosseini", "Rezaei", "Karimi", "Mousavi", "Jafari", "Ahmadi", "Nouri", "Sadeghi", "Kazemi"
 };
 
 void processModemLine(const String& line);
 String sendAT(const String& cmd, unsigned long timeout = 2000, bool trimResponse = true);
 String readIccid();
 void setLed(bool on);
+void enterTransportWait();
+bool transportReady();
+bool ensureGprs();
+void closeGprs();
+void clearPendingLogin();
+
+struct LoopWdtHold {
+    LoopWdtHold() { disableLoopWDT(); }
+    ~LoopWdtHold() { enableLoopWDT(); }
+};
 
 /* -------------------------------------------------------------------------
  * Helpers
@@ -130,6 +160,8 @@ void enterState(RunState next) {
     state = next;
     stateEnteredAt = millis();
     if (next == ST_ERROR) {
+        sendCodePosted = false;
+        clearPendingLogin();
         applyErrorLeds();
         if (lastError.length()) {
             SerialMon.printf("[STATE] error: %s  (LED قرمز NETLIGHT)\n", lastError.c_str());
@@ -139,6 +171,22 @@ void enterState(RunState next) {
         return;
     }
     SerialMon.printf("[STATE] %s\n", stateName(next));
+}
+
+void enterTransportWait() {
+#if USE_WIFI_TRANSPORT
+    enterState(ST_WAIT_WIFI);
+#else
+    enterState(ST_WAIT_GPRS);
+#endif
+}
+
+bool transportReady() {
+#if USE_WIFI_TRANSPORT
+    return WiFi.status() == WL_CONNECTED;
+#else
+    return gprsReady;
+#endif
 }
 
 String digitsOnly(const String& in) {
@@ -249,19 +297,64 @@ String decodeSmsBody(String text) {
     return text;
 }
 
-String extractOtp(const String& text) {
-    String d = digitsOnly(text);
-    if (d.length() < 4) return "";
-    if (d.length() >= 5) {
-        int idx = (int)d.length() - 5;
-        if (idx < 0) idx = 0;
-        for (int i = 0; i + 5 <= (int)d.length(); ++i) {
-            String five = d.substring(i, i + 5);
-            if (five[0] != '0' || five != "00000") return five;
+int smsDigitAt(const String& s, size_t i, size_t& next) {
+    if (i >= s.length()) return -1;
+    uint8_t c = (uint8_t)s[i];
+    if (c >= '0' && c <= '9') {
+        next = i + 1;
+        return (int)(c - '0');
+    }
+    if (c == 0xDB && i + 1 < s.length()) {
+        uint8_t d = (uint8_t)s[i + 1];
+        if (d >= 0xB0 && d <= 0xB9) {
+            next = i + 2;
+            return (int)(d - 0xB0);
         }
     }
-    if (d.length() == 4 || d.length() == 6) return d;
-    return d.substring(d.length() - 5);
+    if (c == 0xD9 && i + 1 < s.length()) {
+        uint8_t d = (uint8_t)s[i + 1];
+        if (d >= 0xA0 && d <= 0xA9) {
+            next = i + 2;
+            return (int)(d - 0xA0);
+        }
+    }
+    return -1;
+}
+
+bool smsLooksLikeEitaa(const String& text) {
+    String ascii = text;
+    ascii.toLowerCase();
+    if (ascii.indexOf("eitaa") >= 0) return true;
+    if (text.indexOf("ایتا") >= 0) return true;
+    if (text.indexOf("ايتا") >= 0) return true;
+    return false;
+}
+
+String extractFiveConsecutiveDigits(const String& text) {
+    size_t i = 0;
+    while (i < text.length()) {
+        size_t next = i;
+        if (smsDigitAt(text, i, next) < 0) {
+            i += 1;
+            continue;
+        }
+        String run;
+        size_t j = i;
+        while (true) {
+            int d = smsDigitAt(text, j, next);
+            if (d < 0) break;
+            run += (char)('0' + d);
+            j = next;
+        }
+        if (run.length() == 5 && run != "00000") return run;
+        i = j > i ? j : i + 1;
+    }
+    return "";
+}
+
+String extractOtp(const String& text) {
+    if (!smsLooksLikeEitaa(text)) return "";
+    return extractFiveConsecutiveDigits(text);
 }
 
 String randomImei() {
@@ -290,6 +383,7 @@ void pickSignupName() {
     lastName = configuredLast.length()
                    ? configuredLast
                    : String(kLastNames[esp_random() % (sizeof(kLastNames) / sizeof(kLastNames[0]))]);
+    if (!firstName.length()) firstName = "Ali";
 }
 
 String quotedField(const String& line, int index) {
@@ -314,11 +408,12 @@ bool cpinSaysReady(const String& cpin) {
 bool cpinSaysMissing(const String& cpin) {
     String u = cpin;
     u.toUpperCase();
+    // Only treat explicit absence as removed. "SIM FAILURE" happens while an
+    // SMS is arriving and used to restart the whole login (second sendCode).
     return u.indexOf("NOT INSERTED") >= 0
         || u.indexOf("SIM NOT INSERTED") >= 0
         || u.indexOf("NO SIM") >= 0
-        || u.indexOf("SIM REMOVAL") >= 0
-        || u.indexOf("SIM FAILURE") >= 0;
+        || u.indexOf("SIM REMOVAL") >= 0;
 }
 
 bool simReady() {
@@ -397,7 +492,8 @@ void serviceLed() {
         case ST_SIGN_IN:
         case ST_SIGN_UP:
         case ST_REGISTER_AM: interval = 180; break;
-        case ST_WAIT_FLOOD: interval = 250; break;
+        case ST_WAIT_FLOOD:
+        case ST_WAIT_GPRS: interval = 250; break;
         default: interval = 500; break;
     }
     if (millis() - lastLedToggle < interval) return;
@@ -459,6 +555,7 @@ void initModem() {
     pinMode(MODEM_RST, OUTPUT);
     digitalWrite(MODEM_RST, HIGH);
 
+    SerialAT.setRxBufferSize(4096);
     SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
     delay(2500);
     if (!waitForModem(12000)) {
@@ -524,16 +621,19 @@ String sendAT(const String& cmd, unsigned long timeout, bool trimResponse) {
 
 void processModemLine(const String& line) {
     static bool readingText = false;
+    static String smsHeader;
 
     if (readingText) {
         readingText = false;
-        pendingSmsText = decodeSmsBody(line);
+        pendingSmsText = smsHeader + "\n" + decodeSmsBody(line);
         pendingSms = true;
         SerialMon.printf("[SMS] %s\n", pendingSmsText.c_str());
+        smsHeader = "";
         return;
     }
 
     if (line.startsWith("+CMT:") || line.startsWith("+CMGL:")) {
+        smsHeader = decodeSmsBody(line);
         readingText = true;
         return;
     }
@@ -557,9 +657,15 @@ void pollStoredSms() {
             body.trim();
         }
         if (body.length()) {
-            pendingSmsText = decodeSmsBody(body);
-            pendingSms = true;
-            SerialMon.printf("[SMS/SIM] %s\n", pendingSmsText.c_str());
+            String hdr = decodeSmsBody(resp.substring(header, nl));
+            String candidate = hdr + "\n" + decodeSmsBody(body);
+            SerialMon.printf("[SMS/SIM] %s\n", candidate.c_str());
+            if (extractOtp(candidate).length() == 5) {
+                pendingSmsText = candidate;
+                pendingSms = true;
+                return;
+            }
+            SerialMon.println("[SMS] ایتا نیست یا ۵ رقم پشت‌سرهم ندارد — رد شد");
         }
         pos = end;
     }
@@ -570,10 +676,322 @@ void clearSmsInbox() {
 }
 
 /* -------------------------------------------------------------------------
- * HTTP
+ * HTTP (WiFi LAN or SIM800 GPRS)
  * ------------------------------------------------------------------------- */
 
-bool postJson(const String& url, const String& body, String& response, int& status) {
+String detectApn() {
+    String configured = GPRS_APN;
+    configured.trim();
+    if (configured.length()) return configured;
+    // This batch is Irancell (ICCID 899811…). Prefer ICCID over a messy CIMI parse.
+    if (iccid.startsWith("899811") || phone.startsWith("98993") || phone.startsWith("98901")
+        || phone.startsWith("98902") || phone.startsWith("98903")) {
+        return "mtnirancell";
+    }
+    if (iccid.startsWith("899801") || iccid.startsWith("899802")) return "mcinet";
+    String imsi = digitsOnly(sendAT("AT+CIMI", 2500, true));
+    if (imsi.indexOf("43235") >= 0) return "mtnirancell";
+    if (imsi.indexOf("43220") >= 0) return "rightel";
+    if (imsi.indexOf("43211") >= 0) return "mcinet";
+    return "mtnirancell";
+}
+
+void drainSerialAt() {
+    while (SerialAT.available()) SerialAT.read();
+}
+
+void closeGprs() {
+#if !USE_WIFI_TRANSPORT
+    gsmTcp.stop();
+    modem.gprsDisconnect();
+#endif
+    gprsReady = false;
+    gprsIp = "";
+}
+
+bool ensureGprs() {
+#if USE_WIFI_TRANSPORT
+    return false;
+#else
+    if (gprsReady && modem.isGprsConnected()) return true;
+    gprsReady = false;
+    gprsApn = detectApn();
+    SerialMon.printf("[GPRS] attach APN=%s\n", gprsApn.c_str());
+    drainSerialAt();
+    sendAT("AT+HTTPTERM", 1500, true);
+    sendAT("AT+SAPBR=0,1", 5000, true);
+    sendAT("AT+CIPSHUT", 8000, true);
+    drainSerialAt();
+    if (!modem.gprsConnect(gprsApn.c_str(), GPRS_USER, GPRS_PASS)) {
+        lastError = "gprs attach failed apn=" + gprsApn;
+        SerialMon.printf("[GPRS] failed: %s\n", lastError.c_str());
+        return false;
+    }
+    gprsIp = modem.getLocalIP();
+    gprsReady = true;
+    SerialMon.printf("[GPRS] ip=%s\n", gprsIp.c_str());
+    return true;
+#endif
+}
+
+#if !USE_WIFI_TRANSPORT
+bool parseHttpUrl(const String& url, String& host, String& path, uint16_t& port) {
+    String u = url;
+    u.trim();
+    if (u.startsWith("https://")) u.remove(0, 8);
+    else if (u.startsWith("http://")) u.remove(0, 7);
+    int slash = u.indexOf('/');
+    String hp = slash < 0 ? u : u.substring(0, slash);
+    path = slash < 0 ? "/" : u.substring(slash);
+    int colon = hp.indexOf(':');
+    if (colon >= 0) {
+        host = hp.substring(0, colon);
+        port = (uint16_t)hp.substring(colon + 1).toInt();
+        if (port == 80) port = 443;
+    } else {
+        host = hp;
+        port = 443;
+    }
+    return host.length() > 0;
+}
+
+int tlsSend(void* ctx, const unsigned char* buf, size_t len) {
+    TinyGsmClient* c = static_cast<TinyGsmClient*>(ctx);
+    size_t sent = 0;
+    unsigned long start = millis();
+    while (sent < len) {
+        if (!c->connected()) return MBEDTLS_ERR_NET_CONN_RESET;
+        int n = c->write(buf + sent, len - sent);
+        if (n > 0) {
+            sent += (size_t)n;
+            continue;
+        }
+        if (millis() - start > 30000) return MBEDTLS_ERR_SSL_TIMEOUT;
+        delay(10);
+    }
+    return (int)sent;
+}
+
+int tlsRecv(void* ctx, unsigned char* buf, size_t len) {
+    TinyGsmClient* c = static_cast<TinyGsmClient*>(ctx);
+    unsigned long start = millis();
+    while (!c->available()) {
+        if (!c->connected()) return MBEDTLS_ERR_NET_CONN_RESET;
+        if (millis() - start > 45000) return MBEDTLS_ERR_SSL_TIMEOUT;
+        delay(5);
+    }
+    int n = c->read(buf, len);
+    if (n > 0) return n;
+    return MBEDTLS_ERR_SSL_WANT_READ;
+}
+
+int sslWriteAll(mbedtls_ssl_context* ssl, const uint8_t* data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        int n = mbedtls_ssl_write(ssl, data + sent, len - sent);
+        if (n > 0) {
+            sent += (size_t)n;
+            continue;
+        }
+        if (n == MBEDTLS_ERR_SSL_WANT_WRITE || n == MBEDTLS_ERR_SSL_WANT_READ) {
+            delay(5);
+            continue;
+        }
+        return n;
+    }
+    return (int)sent;
+}
+
+bool parseHttpResponse(const String& raw, int& status, String& body) {
+    if (!raw.startsWith("HTTP/")) return false;
+    int sp = raw.indexOf(' ');
+    if (sp < 0) return false;
+    status = raw.substring(sp + 1).toInt();
+    int sep = raw.indexOf("\r\n\r\n");
+    int skip = 4;
+    if (sep < 0) {
+        sep = raw.indexOf("\n\n");
+        skip = 2;
+    }
+    if (sep < 0) {
+        body = "";
+        return true;
+    }
+    body = raw.substring(sep + skip);
+    return true;
+}
+
+bool postJsonGprs(const String& url, const String& body, String& response, int& status,
+                  const char* contentType = "application/json") {
+    response = "";
+    status = -1;
+    if (!ensureGprs()) return false;
+
+    LoopWdtHold pauseWdt;
+
+    String host, path;
+    uint16_t port = 443;
+    if (!parseHttpUrl(url, host, path, port)) {
+        lastError = "bad url " + url;
+        return false;
+    }
+
+    sendAT("AT+CNMI=0,0,0,0,0", 1000, true);
+    drainSerialAt();
+
+    SerialMon.printf("[GPRS] TLS POST https://%s:%u%s heap=%u\n",
+                     host.c_str(), port, path.c_str(), ESP.getFreeHeap());
+    gsmTcp.stop();
+    if (!gsmTcp.connect(host.c_str(), port)) {
+        lastError = "tcp connect failed " + host + ":" + String(port);
+        sendAT("AT+CNMI=2,2,0,0,0", 1000, true);
+        return false;
+    }
+
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context drbg;
+    mbedtls_ssl_init(&ssl);
+    mbedtls_ssl_config_init(&conf);
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&drbg);
+
+    const char* pers = "eitaa-ac";
+    int ret = mbedtls_ctr_drbg_seed(&drbg, mbedtls_entropy_func, &entropy,
+                                    reinterpret_cast<const unsigned char*>(pers), strlen(pers));
+    if (ret != 0) {
+        lastError = "tls rng " + String(ret);
+        gsmTcp.stop();
+        sendAT("AT+CNMI=2,2,0,0,0", 1000, true);
+        return false;
+    }
+    mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+                                MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);
+    mbedtls_ssl_setup(&ssl, &conf);
+    mbedtls_ssl_set_hostname(&ssl, host.c_str());
+    mbedtls_ssl_set_bio(&ssl, &gsmTcp, tlsSend, tlsRecv, nullptr);
+
+    unsigned long hsStart = millis();
+    while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            char errbuf[48];
+            mbedtls_strerror(ret, errbuf, sizeof(errbuf));
+            lastError = String("tls handshake ") + errbuf;
+            mbedtls_ssl_free(&ssl);
+            mbedtls_ssl_config_free(&conf);
+            mbedtls_ctr_drbg_free(&drbg);
+            mbedtls_entropy_free(&entropy);
+            gsmTcp.stop();
+            sendAT("AT+CNMI=2,2,0,0,0", 1000, true);
+            return false;
+        }
+        if (millis() - hsStart > 45000) {
+            lastError = "tls handshake timeout";
+            mbedtls_ssl_free(&ssl);
+            mbedtls_ssl_config_free(&conf);
+            mbedtls_ctr_drbg_free(&drbg);
+            mbedtls_entropy_free(&entropy);
+            gsmTcp.stop();
+            sendAT("AT+CNMI=2,2,0,0,0", 1000, true);
+            return false;
+        }
+        delay(5);
+    }
+    SerialMon.printf("[GPRS] TLS برقرار شد (%lu ms)\n", millis() - hsStart);
+
+    String apiKey = ACCOUNT_MANAGER_API_KEY;
+    apiKey.trim();
+    String req;
+    req.reserve(body.length() + host.length() + 180);
+    req += "POST ";
+    req += path;
+    req += " HTTP/1.0\r\nHost: ";
+    req += host;
+    req += "\r\nContent-Type: ";
+    req += contentType;
+    req += "\r\nAccept: */*\r\nContent-Length: ";
+    req += String(body.length());
+    req += "\r\nConnection: close\r\n";
+    if (apiKey.length() && path.indexOf("/accounts") >= 0) {
+        req += "Authorization: Bearer ";
+        req += apiKey;
+        req += "\r\n";
+    }
+    req += "\r\n";
+    req += body;
+
+    ret = sslWriteAll(&ssl, reinterpret_cast<const uint8_t*>(req.c_str()), req.length());
+    if (ret < 0) {
+        lastError = "tls write " + String(ret);
+        mbedtls_ssl_close_notify(&ssl);
+        mbedtls_ssl_free(&ssl);
+        mbedtls_ssl_config_free(&conf);
+        mbedtls_ctr_drbg_free(&drbg);
+        mbedtls_entropy_free(&entropy);
+        gsmTcp.stop();
+        sendAT("AT+CNMI=2,2,0,0,0", 1000, true);
+        return false;
+    }
+
+    String raw;
+    raw.reserve(4096);
+    uint8_t buf[512];
+    unsigned long rdStart = millis();
+    while (millis() - rdStart < 60000) {
+        int n = mbedtls_ssl_read(&ssl, buf, sizeof(buf));
+        if (n > 0) {
+            for (int i = 0; i < n; ++i) raw += (char)buf[i];
+            continue;
+        }
+        if (n == 0 || n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) break;
+        if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            delay(5);
+            continue;
+        }
+        break;
+    }
+
+    mbedtls_ssl_close_notify(&ssl);
+    mbedtls_ssl_free(&ssl);
+    mbedtls_ssl_config_free(&conf);
+    mbedtls_ctr_drbg_free(&drbg);
+    mbedtls_entropy_free(&entropy);
+    gsmTcp.stop();
+    sendAT("AT+CNMI=2,2,0,0,0", 1000, true);
+
+    if (!parseHttpResponse(raw, status, response)) {
+        lastError = "gprs bad HTTP response " + raw.substring(0, 80);
+        return false;
+    }
+    SerialMon.printf("[GPRS] POST https://%s%s -> %d (%u bytes)\n",
+                     host.c_str(), path.c_str(), status, (unsigned)response.length());
+    if (status < 200 || status >= 300) {
+        lastError = "gprs HTTP " + String(status) + " https://" + host + path;
+        return false;
+    }
+    return true;
+}
+#endif
+
+#if USE_WIFI_TRANSPORT
+bool isLanHttpHost(const String& url) {
+    return url.indexOf("10.10.") >= 0 || url.indexOf("192.168.") >= 0
+        || url.indexOf("127.0.0.1") >= 0 || url.indexOf("localhost") >= 0;
+}
+
+String withHttpsIfPublic(const String& url) {
+    if (!url.startsWith("http://") || isLanHttpHost(url)) return url;
+    String u = url;
+    u.replace("http://", "https://");
+    return u;
+}
+
+bool postJsonWifi(const String& url, const String& body, String& response, int& status,
+                  const char* contentType = "application/json") {
+    String realUrl = withHttpsIfPublic(url);
     response = "";
     status = -1;
     lastError = "";
@@ -582,43 +1000,75 @@ bool postJson(const String& url, const String& body, String& response, int& stat
         return false;
     }
 
+    LoopWdtHold pauseWdt;
+
     HTTPClient http;
     http.setConnectTimeout(12000);
     http.setTimeout(60000);
     http.setReuse(false);
+    http.useHTTP10(true);
 
     WiFiClient client;
     WiFiClientSecure secure;
     bool began = false;
-    if (url.startsWith("https://")) {
+    if (realUrl.startsWith("https://")) {
         secure.setInsecure();
-        began = http.begin(secure, url);
+        secure.setHandshakeTimeout(45);
+        began = http.begin(secure, realUrl);
     } else {
-        began = http.begin(client, url);
+        began = http.begin(client, realUrl);
     }
     if (!began) {
-        lastError = String("http begin failed url=") + url;
+        lastError = String("http begin failed url=") + realUrl;
         return false;
     }
 
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Accept", "application/json");
+    http.addHeader("Content-Type", contentType);
+    http.addHeader("Accept", "*/*");
     String apiKey = ACCOUNT_MANAGER_API_KEY;
     apiKey.trim();
-    if (apiKey.length() && url.indexOf("/accounts") >= 0) {
+    if (apiKey.length() && realUrl.indexOf("/accounts") >= 0) {
         http.addHeader("Authorization", String("Bearer ") + apiKey);
     }
 
-    status = http.POST(body);
+    status = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.c_str())),
+                       body.length());
     if (status <= 0) {
         lastError = String("HTTP ") + String(status) + " " + http.errorToString(status)
-            + " url=" + url + " ip=" + WiFi.localIP().toString();
+            + " url=" + realUrl + " ip=" + WiFi.localIP().toString();
         http.end();
         return false;
     }
-    response = http.getString();
+    int nbytes = http.getSize();
+    if (nbytes > 0) {
+        response.reserve((size_t)nbytes);
+    }
+    WiFiClient* stream = http.getStreamPtr();
+    if (stream) {
+        unsigned long start = millis();
+        while (http.connected() && (nbytes < 0 || (int)response.length() < nbytes)
+               && millis() - start < 60000) {
+            while (stream->available()) {
+                response += (char)stream->read();
+                feedLoopWDT();
+            }
+            delay(5);
+        }
+    }
+    if (!response.length()) response = http.getString();
     http.end();
     return true;
+}
+#endif
+
+bool postJson(const String& url, const String& body, String& response, int& status,
+              const char* contentType = "application/json") {
+    lastError = "";
+#if USE_WIFI_TRANSPORT
+    return postJsonWifi(url, body, response, status, contentType);
+#else
+    return postJsonGprs(url, body, response, status, contentType);
+#endif
 }
 
 bool parseObject(const String& json, DynamicJsonDocument& doc) {
@@ -680,10 +1130,54 @@ String tlError(JsonObject obj) {
 }
 
 bool gatewayCall(const char* method, JsonObject param, DynamicJsonDocument& out, String& ctor) {
+    if (!sessionImei.length()) sessionImei = randomImei();
+
+#if USE_DIRECT_EITAA
+    String bin;
+    if (!eitaaTlEncodeCall(method, param, sessionToken, sessionImei, bin)) {
+        lastError = String("tl encode failed: ") + method;
+        return false;
+    }
+    const char* host = eitaaPickHost();
+    String url = eitaaHostUrl(host);
+    SerialMon.printf("[EITAA] %s → %s (%u bytes)\n", method, url.c_str(), (unsigned)bin.length());
+
+    String response;
+    int status = -1;
+    if (!postJson(url, bin, response, status, "application/octet-stream")) {
+        eitaaRotateHost();
+        lastError = String("eitaa unreachable: ") + lastError;
+        return false;
+    }
+    if (status < 200 || status >= 300) {
+        eitaaRotateHost();
+        lastError = "eitaa HTTP " + String(status) + " " + url;
+        return false;
+    }
+    if (!eitaaTlDecode(reinterpret_cast<const uint8_t*>(response.c_str()),
+                       response.length(), out)) {
+        char hex[24];
+        size_t n = response.length() < 8 ? response.length() : 8;
+        hex[0] = 0;
+        for (size_t i = 0; i < n; ++i) {
+            snprintf(hex + i * 2, 3, "%02x", (uint8_t)response[i]);
+        }
+        lastError = String("tl decode failed n=") + String(response.length())
+            + " head=" + hex;
+        return false;
+    }
+    ctor = out["_"] | "";
+    String err = tlError(out.as<JsonObject>());
+    if (err.length()) {
+        lastError = err;
+        return false;
+    }
+    return true;
+#else
     DynamicJsonDocument req(2048);
     req["method"] = method;
     req["param"] = param;
-    req["token"] = "";
+    req["token"] = sessionToken;
     req["imei"] = sessionImei;
 
     String body;
@@ -718,17 +1212,15 @@ bool gatewayCall(const char* method, JsonObject param, DynamicJsonDocument& out,
         return false;
     }
     return true;
+#endif
 }
 
 bool sendCode() {
     DynamicJsonDocument req(1024);
     JsonObject param = req.createNestedObject("p");
     param["phone_number"] = phone;
-    // Dashboard/Bruno send api_id=0 + empty hash so the gateway fills production
-    // defaults. Sending 1782360 with current_number=true is the native-app path
-    // that FLOOD_WAIT's unoccupied numbers.
-    param["api_id"] = 0;
-    param["api_hash"] = "";
+    param["api_id"] = EITAA_API_ID;
+    param["api_hash"] = EITAA_API_HASH;
     JsonObject settings = param.createNestedObject("settings");
     settings["_"] = "codeSettings";
     settings["flags"] = 0;
@@ -755,6 +1247,7 @@ bool sendCode() {
     SerialMon.printf("[EITAA] کد ارسال شد type=%s next=%s timeout=%d hash=%s — منتظر SMS\n",
                      codeType.c_str(), nextType.c_str(), timeout,
                      maskSecret(phoneCodeHash).c_str());
+    sendCodePosted = true;
     return true;
 }
 
@@ -915,6 +1408,24 @@ void rememberSuccess() {
     if (!prefs.begin("eitaa-ac", false)) return;
     prefs.putString("iccid", iccid);
     prefs.putString("phone", phone);
+    prefs.remove("p_iccid");
+    prefs.remove("p_hash");
+    prefs.remove("p_imei");
+    prefs.remove("p_phone");
+    prefs.remove("p_first");
+    prefs.remove("p_last");
+    prefs.end();
+}
+
+void clearPendingLogin() {
+    Preferences prefs;
+    if (!prefs.begin("eitaa-ac", false)) return;
+    prefs.remove("p_iccid");
+    prefs.remove("p_hash");
+    prefs.remove("p_imei");
+    prefs.remove("p_phone");
+    prefs.remove("p_first");
+    prefs.remove("p_last");
     prefs.end();
 }
 
@@ -935,6 +1446,7 @@ void resetSessionFields() {
     pendingSms = false;
     pendingSmsText = "";
     sendCodeAttempts = 0;
+    sendCodePosted = false;
     lastError = "";
 }
 
@@ -945,17 +1457,27 @@ void handleSimRemoved() {
     if (!labelFromSerial) accountLabel = "";
     resetSessionFields();
     forceRetry = false;
+    clearPendingLogin();
+#if !USE_WIFI_TRANSPORT
+    closeGprs();
+#endif
     enterState(ST_WAIT_SIM);
 }
 
 bool pollSimStillPresent() {
     if (millis() - lastSimPoll < 4000) return true;
     lastSimPoll = millis();
+    static uint8_t goneHits = 0;
     String cpin = sendAT("AT+CPIN?", 3000, true);
     if (simAbsent(cpin)) {
+        goneHits++;
+        SerialMon.printf("[SIM] نبود سیم تأیید %d/2: %s\n", goneHits, cpin.c_str());
+        if (goneHits < 2) return true;
+        goneHits = 0;
         handleSimRemoved();
         return false;
     }
+    goneHits = 0;
     return true;
 }
 
@@ -971,8 +1493,23 @@ void handleHealth() {
     doc["phone"] = phone;
     doc["csq"] = lastCsq;
     doc["creg"] = lastCreg;
+#if USE_WIFI_TRANSPORT
+#if USE_PHONE_HOTSPOT
+    doc["transport"] = "hotspot";
+    doc["ssid"] = HOTSPOT_SSID;
+#else
+    doc["transport"] = "wifi";
+    doc["ssid"] = WIFI_SSID;
+#endif
     doc["wifi"] = WiFi.status() == WL_CONNECTED;
     doc["ip"] = WiFi.localIP().toString();
+#else
+    doc["transport"] = "gprs";
+    doc["wifi"] = false;
+    doc["ip"] = gprsIp;
+    doc["apn"] = gprsApn;
+    doc["gprs"] = gprsReady;
+#endif
     doc["error"] = lastError;
     String body;
     serializeJson(doc, body);
@@ -987,7 +1524,7 @@ void handleSerialLine(String line) {
     if (upper.startsWith("PHONE ")) {
         phone = normalizePhone(line.substring(6));
         SerialMon.printf("[CFG] شماره تنظیم شد: %s\n", phone.c_str());
-        if (state == ST_WAIT_PHONE && isIranMsisdn(phone)) enterState(ST_WAIT_WIFI);
+        if (state == ST_WAIT_PHONE && isIranMsisdn(phone)) enterTransportWait();
         return;
     }
     if (upper.startsWith("LABEL ")) {
@@ -999,15 +1536,27 @@ void handleSerialLine(String line) {
     }
     if (upper == "RETRY") {
         forceRetry = true;
+        clearPendingLogin();
         resetSessionFields();
         SerialMon.println("[CFG] RETRY — فلو از نو");
         enterState(simReady() ? ST_WAIT_NET : ST_WAIT_SIM);
         return;
     }
     if (upper == "STATUS") {
-        SerialMon.printf("[STATUS] state=%s phone=%s iccid=%s csq=%d wifi=%s err=%s\n",
+        SerialMon.printf("[STATUS] state=%s phone=%s iccid=%s csq=%d transport=%s ip=%s err=%s\n",
                          stateName(state), phone.c_str(), iccid.c_str(), lastCsq,
-                         WiFi.status() == WL_CONNECTED ? "yes" : "no", lastError.c_str());
+#if USE_WIFI_TRANSPORT
+#if USE_PHONE_HOTSPOT
+                         WiFi.status() == WL_CONNECTED ? "hotspot" : "hotspot-down",
+#else
+                         WiFi.status() == WL_CONNECTED ? "wifi" : "wifi-down",
+#endif
+                         WiFi.localIP().toString().c_str(),
+#else
+                         gprsReady ? "gprs" : "gprs-down",
+                         gprsIp.c_str(),
+#endif
+                         lastError.c_str());
         return;
     }
     SerialMon.println("[CFG] دستورها: PHONE 9891… | LABEL نام | RETRY | STATUS");
@@ -1025,11 +1574,28 @@ void serviceSerial() {
     }
 }
 
+#if USE_WIFI_TRANSPORT
+const char* wifiSsid() {
+#if USE_PHONE_HOTSPOT
+    return HOTSPOT_SSID;
+#else
+    return WIFI_SSID;
+#endif
+}
+
+const char* wifiPass() {
+#if USE_PHONE_HOTSPOT
+    return HOTSPOT_PASS;
+#else
+    return WIFI_PASS;
+#endif
+}
+
 void connectWifi() {
     if (WiFi.status() == WL_CONNECTED) return;
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
-#if USE_STATIC_IP
+#if USE_INTERNAL_NETWORK && USE_STATIC_IP
     IPAddress local(STATIC_IP_A, STATIC_IP_B, STATIC_IP_C, STATIC_IP_D);
     IPAddress gw(STATIC_IP_A, STATIC_IP_B, STATIC_IP_C, GATEWAY_IP_D);
     IPAddress mask(255, 255, 255, 0);
@@ -1043,8 +1609,10 @@ void connectWifi() {
 #else
     SerialMon.println("[WIFI] DHCP");
 #endif
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    SerialMon.printf("[WIFI] connecting %s\n", wifiSsid());
+    WiFi.begin(wifiSsid(), wifiPass());
 }
+#endif
 
 /* -------------------------------------------------------------------------
  * Setup / loop
@@ -1056,18 +1624,33 @@ void setup() {
     SerialMon.println("\n=======================================================");
     SerialMon.println(" TTGO T-Call  |  Eitaa Account Creator");
     SerialMon.println("=======================================================");
+    SerialMon.printf("reset=%d\n", (int)esp_reset_reason());
+#if USE_DIRECT_EITAA
+    SerialMon.println("Gateway: onboard TL → hasan.eitaa.ir (گیت‌وی روی برد)");
+#else
     SerialMon.printf("Gateway: %s\n", EITAA_GATEWAY_URL);
+#endif
     SerialMon.printf("Account Manager: %s\n", ACCOUNT_MANAGER_URL);
+#if USE_PHONE_HOTSPOT
+    SerialMon.printf("Transport: هات‌اسپات %s + گیت‌وی روی برد\n", HOTSPOT_SSID);
+#elif USE_INTERNAL_NETWORK
+    SerialMon.println("Transport: WiFi / شبکه داخلی");
+#else
+    SerialMon.println("Transport: داده سیم‌کارت (GPRS + TLS روی ESP32)");
+#endif
     SerialMon.println("دستور سریال: PHONE 9891… | LABEL … | RETRY | STATUS");
 
     phone = normalizePhone(PHONE_NUMBER);
 
     initModem();
+#if USE_WIFI_TRANSPORT
     connectWifi();
-
     httpServer.on("/health", HTTP_GET, handleHealth);
     httpServer.on("/", HTTP_GET, handleHealth);
     httpServer.begin();
+#else
+    WiFi.mode(WIFI_OFF);
+#endif
 
     enterState(ST_WAIT_SIM);
 }
@@ -1076,11 +1659,12 @@ void loop() {
     drainModem();
     serviceSerial();
     serviceLed();
+#if USE_WIFI_TRANSPORT
     httpServer.handleClient();
-
     if (WiFi.status() != WL_CONNECTED && millis() % 15000 < 30) {
         connectWifi();
     }
+#endif
 
     switch (state) {
         case ST_WAIT_SIM:
@@ -1138,7 +1722,7 @@ void loop() {
             if (!pollSimStillPresent()) break;
             if (isIranMsisdn(phone)) {
                 SerialMon.printf("[SIM] شماره=%s\n", phone.c_str());
-                enterState(ST_WAIT_WIFI);
+                enterTransportWait();
                 break;
             }
             if (millis() - lastNetPoll < 2500) break;
@@ -1146,20 +1730,48 @@ void loop() {
             phone = readCnum();
             if (isIranMsisdn(phone)) {
                 SerialMon.printf("[SIM] شماره از CNUM=%s\n", phone.c_str());
-                enterState(ST_WAIT_WIFI);
+                enterTransportWait();
             } else {
                 SerialMon.println("[SIM] شماره در جدول ICCID نیست. در سریال بزنید: PHONE 98912xxxxxxx");
             }
             break;
 
         case ST_WAIT_WIFI:
+#if USE_WIFI_TRANSPORT
             if (WiFi.status() == WL_CONNECTED) {
-                SerialMon.printf("[WIFI] %s -> %s\n", WiFi.localIP().toString().c_str(), EITAA_GATEWAY_URL);
+#if USE_DIRECT_EITAA
+                SerialMon.printf("[WIFI] %s ssid=%s → eitaa.ir (گیت‌وی روی برد)\n",
+                                 WiFi.localIP().toString().c_str(), wifiSsid());
+#else
+                SerialMon.printf("[WIFI] %s ssid=%s → %s\n",
+                                 WiFi.localIP().toString().c_str(), wifiSsid(),
+                                 EITAA_GATEWAY_URL);
+#endif
                 enterState(sessionToken.length() ? ST_REGISTER_AM : ST_SEND_CODE);
-            } else if (millis() - stateEnteredAt > 45000) {
-                lastError = "wifi timeout";
+            } else if (millis() - stateEnteredAt > 60000) {
+                lastError = String("wifi timeout ssid=") + wifiSsid();
                 enterState(ST_ERROR);
             }
+#else
+            enterState(ST_WAIT_GPRS);
+#endif
+            break;
+
+        case ST_WAIT_GPRS:
+#if USE_WIFI_TRANSPORT
+            enterState(ST_WAIT_WIFI);
+#else
+            if (!pollSimStillPresent()) break;
+            if (millis() - stateEnteredAt > 200 && millis() - lastNetPoll < 4000) break;
+            lastNetPoll = millis();
+            if (ensureGprs()) {
+                SerialMon.printf("[GPRS] آماده ip=%s -> %s\n", gprsIp.c_str(), EITAA_GATEWAY_URL);
+                enterState(sessionToken.length() ? ST_REGISTER_AM : ST_SEND_CODE);
+            } else if (millis() - stateEnteredAt > GPRS_WAIT_MS) {
+                if (!lastError.length()) lastError = "gprs timeout";
+                enterState(ST_ERROR);
+            }
+#endif
             break;
 
         case ST_WAIT_FLOOD:
@@ -1177,12 +1789,17 @@ void loop() {
             break;
 
         case ST_SEND_CODE:
-            if (WiFi.status() != WL_CONNECTED) {
-                enterState(ST_WAIT_WIFI);
+            if (!transportReady()) {
+                enterTransportWait();
                 break;
             }
             if (floodActive()) {
                 enterState(ST_WAIT_FLOOD);
+                break;
+            }
+            if (sendCodePosted) {
+                SerialMon.println("[EITAA] sendCode همین دور زده شد؛ تکرار نمی‌شود");
+                enterState(ST_WAIT_SMS);
                 break;
             }
             if (!sessionImei.length()) sessionImei = randomImei();
@@ -1213,14 +1830,14 @@ void loop() {
             if (pendingSms) {
                 pendingSms = false;
                 String code = extractOtp(pendingSmsText);
-                if (code.length() >= 4) {
+                if (code.length() == 5) {
                     phoneCode = code;
                     SerialMon.printf("[EITAA] کد SMS: %s\n", phoneCode.c_str());
                     clearSmsInbox();
                     enterState(ST_SIGN_IN);
                     break;
                 }
-                SerialMon.println("[SMS] پیام بدون کد OTP نادیده گرفته شد");
+                SerialMon.println("[SMS] ایتا نیست یا ۵ رقم پشت‌سرهم ندارد — منتظر پیامک بعدی");
             }
             if (millis() - lastSmsPoll > 6000) {
                 lastSmsPoll = millis();
@@ -1266,13 +1883,28 @@ void loop() {
         }
 
         case ST_SIGN_UP: {
+            if (!firstName.length()) pickSignupName();
             DynamicJsonDocument out(4096);
             String ctor;
             SerialMon.printf("[EITAA] auth.signUp  %s %s\n", firstName.c_str(), lastName.c_str());
             if (!signUp(ctor, out)) {
-                SerialMon.printf("[EITAA] signUp failed: %s\n", lastError.c_str());
-                enterState(ST_ERROR);
-                break;
+                if (errorIs(lastError, "FIRSTNAME_INVALID") || errorIs(lastError, "LASTNAME_INVALID")) {
+                    firstName = "Ali";
+                    lastName = "Mohammadi";
+                    SerialMon.printf("[EITAA] نام رد شد؛ retry %s %s\n",
+                                     firstName.c_str(), lastName.c_str());
+                    out.clear();
+                    ctor = "";
+                    if (!signUp(ctor, out)) {
+                        SerialMon.printf("[EITAA] signUp failed: %s\n", lastError.c_str());
+                        enterState(ST_ERROR);
+                        break;
+                    }
+                } else {
+                    SerialMon.printf("[EITAA] signUp failed: %s\n", lastError.c_str());
+                    enterState(ST_ERROR);
+                    break;
+                }
             }
             if (ctor != "auth.authorization") {
                 lastError = "unexpected signUp constructor: " + ctor;
@@ -1288,8 +1920,8 @@ void loop() {
         }
 
         case ST_REGISTER_AM:
-            if (WiFi.status() != WL_CONNECTED) {
-                enterState(ST_WAIT_WIFI);
+            if (!transportReady()) {
+                enterTransportWait();
                 break;
             }
             if (!registerAccountManager()) {
@@ -1307,13 +1939,7 @@ void loop() {
             break;
 
         case ST_ERROR:
-            if (!pollSimStillPresent()) break;
-            if (errorIs(lastError, "FLOOD")) break;
-            if (millis() - stateEnteredAt > 15000 && sendCodeAttempts < SEND_CODE_RETRIES
-                && phoneCodeHash.length() == 0) {
-                SerialMon.println("[ERROR] تلاش دوباره sendCode");
-                enterState(ST_SEND_CODE);
-            }
+            pollSimStillPresent();
             break;
     }
 }

@@ -2,17 +2,38 @@
 
 // Copy this file to config.local.h and edit. config.local.h is gitignored.
 
+// --- Transport (pick one) ---
+// Phone hotspot + onboard TL gateway (default):
+// #define USE_PHONE_HOTSPOT 1
+// #define HOTSPOT_SSID "reza"
+// #define HOTSPOT_PASS "12345678"
+
+// Office LAN:
+// #define USE_PHONE_HOTSPOT 0
+// #define USE_INTERNAL_NETWORK 1
+
+// SIM GPRS:
+// #define USE_PHONE_HOTSPOT 0
+// #define USE_INTERNAL_NETWORK 0
+
 // #define WIFI_SSID "Otaq"
 // #define WIFI_PASS "Pour1412#"
 
-// Default is DHCP. To use a static IP instead, uncomment these:
 // #define USE_STATIC_IP 1
 // #define STATIC_IP_C 30
-// #define STATIC_IP_D 201
+// #define STATIC_IP_D 204
 
-// #define EITAA_GATEWAY_URL "http://gateway.irm/send"
-// #define ACCOUNT_MANAGER_URL "http://10.10.20.51:8085"
+// Empty APN = detect from IMSI (Irancell / MCI / Rightel).
+// #define GPRS_APN "mtnirancell"
+
+// 1 (default) = POST TL binary to hasan.eitaa.ir etc. (SIM IP, not the VPS).
+// 0 = JSON through EITAA_GATEWAY_URL (shared server IP gets FLOOD_WAIT).
+// #define USE_DIRECT_EITAA 1
+
+// Public hosts only speak HTTPS (HTTP returns 301).
+// #define EITAA_GATEWAY_URL "https://gateway.ir-ma.ir/send"
+// #define ACCOUNT_MANAGER_URL "https://account-manager.ir-ma.ir"
 // #define ACCOUNT_MANAGER_API_KEY ""
 
-// Force a number if AT+CNUM is empty:
-// #define PHONE_NUMBER "989121234567"
+// SMS wait after sendCode (default 10 minutes; Eitaa can be slow).
+// #define SMS_WAIT_MS 600000
