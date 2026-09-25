@@ -402,13 +402,80 @@ String getNetworkDate() {
     return String("20") + yy + mm + dd;
 }
 
-String buildDatedImei() {
+// Parse an HTTP `Date:` header ("Sat, 26 Sep 2026 18:45:00 GMT")
+// and return today's date in Tehran (UTC+3:30) as YYYYMMDD.
+String parseHttpDateToTehran(const String& hdr) {
+    int c1 = hdr.indexOf(',');
+    if (c1 < 0) return "";
+    String rest = hdr.substring(c1 + 2);
+    rest.trim();
+    int sp1 = rest.indexOf(' ');
+    int sp2 = rest.indexOf(' ', sp1 + 1);
+    int sp3 = rest.indexOf(' ', sp2 + 1);
+    if (sp1 < 0 || sp2 < 0 || sp3 < 0) return "";
+    int day = rest.substring(0, sp1).toInt();
+    String monStr = rest.substring(sp1 + 1, sp2);
+    int year = rest.substring(sp2 + 1, sp3).toInt();
+    String timeStr = rest.substring(sp3 + 1);
+    int hh = timeStr.substring(0, 2).toInt();
+    int mm = timeStr.substring(3, 5).toInt();
+    int ss = timeStr.substring(6, 8).toInt();
+    int month = 0;
+    const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+    for (int i = 0; i < 12; ++i) {
+        if (monStr == months[i]) { month = i + 1; break; }
+    }
+    if (month == 0 || day <= 0 || year <= 0) return "";
+
+    // Tehran = UTC + 3:30. Add 3:30 and handle day rollover.
+    long totalMin = (long)hh * 60 + mm + 3 * 60 + 30 + (ss >= 30 ? 1 : 0);
+    int dayAdd = (int)(totalMin / (24 * 60));
+    int newMin = (int)(totalMin % (24 * 60));
+    (void)newMin;
+    int newDay = day + dayAdd;
+
+    int dim[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+    if (leap) dim[1] = 29;
+    if (newDay > dim[month - 1]) {
+        newDay = 1;
+        month += 1;
+        if (month > 12) { month = 1; year += 1; }
+    }
+    char buf[9];
+    snprintf(buf, sizeof(buf), "%04d%02d%02d", year, month, newDay);
+    return String(buf);
+}
+
+String fetchTehranDate() {
+#if USE_WIFI_TRANSPORT
+    if (WiFi.status() != WL_CONNECTED) return "";
+    LoopWdtHold pauseWdt;
+    WiFiClient client;
+    HTTPClient http;
+    http.setTimeout(8000);
+    const char* hdrs[] = {"Date"};
+    http.collectHeaders(hdrs, 1);
+    if (!http.begin(client, "http://time.ir/")) return "";
+    int code = http.GET();
+    if (code <= 0) { http.end(); return ""; }
+    String dateHdr = http.header("Date");
+    http.end();
+    if (dateHdr.length() < 25) return "";
+    String d = parseHttpDateToTehran(dateHdr);
+    if (d.length() == 8) {
+        SerialMon.printf("[TIME] time.ir Date=%s → تهران %s\n", dateHdr.c_str(), d.c_str());
+    }
+    return d;
+#else
+    return getNetworkDate();
+#endif
+}
+
+String buildDatedImei(const String& date) {
     String base = readModemImei();
-    if (base.length() < 7) return "";
-    String prefix = base.substring(0, 7);
-    String date = getNetworkDate();
-    if (date.length() != 8) return "";
-    return prefix + date;
+    if (base.length() < 7 || date.length() != 8) return "";
+    return base.substring(0, 7) + date;
 }
 
 void setModemImei(const String& imei) {
@@ -422,25 +489,39 @@ void setModemImei(const String& imei) {
 }
 
 void rotateImeiIfNewDay() {
-    String date = getNetworkDate();
+    SerialMon.println("[IMEI] شروع چرخش IMEI روزانه...");
+    String date = fetchTehranDate();
     if (date.length() != 8) {
-        SerialMon.println("[IMEI] تاریخ شبکه در دسترس نیست — رد شد");
+        SerialMon.printf("[IMEI] تاریخ از time.ir در دسترس نیست (got='%s') — رد شد\n", date.c_str());
         return;
     }
+    SerialMon.printf("[IMEI] تاریخ تهران: %s\n", date.c_str());
     Preferences prefs;
-    if (!prefs.begin("eitaa-ac", true)) return;
+    if (!prefs.begin("eitaa-ac", true)) {
+        SerialMon.println("[IMEI] باز کردن Preferences (RO) ناموفق — رد شد");
+        return;
+    }
     String last = prefs.getString("imei_date", "");
     prefs.end();
-    if (last == date) return; // already set today
-    String imei = buildDatedImei();
-    if (imei.length() != 15) {
-        SerialMon.println("[IMEI] ساخت IMEI ناموفق");
+    if (last == date) {
+        SerialMon.printf("[IMEI] امروز (%s) قبلاً چرخش انجام شده — رد شد\n", date.c_str());
         return;
     }
+    SerialMon.printf("[IMEI] آخرین چرخش: '%s' → نیاز به چرخش جدید\n", last.length() ? last.c_str() : "(هیچ)");
+    String imei = buildDatedImei(date);
+    if (imei.length() != 15) {
+        SerialMon.printf("[IMEI] ساخت IMEI ناموفق (len=%d) — رد شد\n", imei.length());
+        return;
+    }
+    SerialMon.printf("[IMEI] IMEI جدید: %s\n", imei.c_str());
     setModemImei(imei);
-    if (!prefs.begin("eitaa-ac", false)) return;
+    if (!prefs.begin("eitaa-ac", false)) {
+        SerialMon.println("[IMEI] باز کردن Preferences (RW) ناموفق — ذخیره نشد");
+        return;
+    }
     prefs.putString("imei_date", date);
     prefs.end();
+    SerialMon.println("[IMEI] چرخش IMEI کامل شد و تاریخ ذخیره شد.");
 }
 
 void pickSignupName() {
@@ -1782,7 +1863,6 @@ void loop() {
             SerialMon.printf("[NET] CREG=%d CSQ=%d\n", lastCreg, lastCsq);
             if (registered && signalOk) {
                 SerialMon.println("[NET] آنتن و شبکه آماده است.");
-                rotateImeiIfNewDay();
                 enterState(ST_WAIT_PHONE);
             } else if (millis() - stateEnteredAt > NETWORK_WAIT_MS) {
                 lastError = "timeout waiting for GSM network";
@@ -1870,6 +1950,7 @@ void loop() {
                 enterState(ST_WAIT_FLOOD);
                 break;
             }
+            rotateImeiIfNewDay();
             if (sendCodePosted) {
                 SerialMon.println("[EITAA] sendCode همین دور زده شد؛ تکرار نمی‌شود");
                 enterState(ST_WAIT_SMS);
