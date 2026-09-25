@@ -1846,7 +1846,13 @@ void loop() {
                     enterState(ST_DONE);
                     break;
                 }
+#if USE_WIFI_TRANSPORT
+                // WiFi mode: first connect internet (for time.ir), rotate IMEI, THEN register GSM
+                enterState(ST_WAIT_WIFI);
+#else
+                // GPRS mode: must register GSM first to get GPRS
                 enterState(ST_WAIT_NET);
+#endif
             } else {
                 SerialMon.println("[SIM] منتظر گذاشتن سیم‌کارت…");
             }
@@ -1875,7 +1881,12 @@ void loop() {
             if (!pollSimStillPresent()) break;
             if (isIranMsisdn(phone)) {
                 SerialMon.printf("[SIM] شماره=%s\n", phone.c_str());
+#if USE_WIFI_TRANSPORT
+                // WiFi already connected earlier (before ST_WAIT_NET); go straight to send code
+                enterState(sessionToken.length() ? ST_REGISTER_AM : ST_SEND_CODE);
+#else
                 enterTransportWait();
+#endif
                 break;
             }
             if (millis() - lastNetPoll < 2500) break;
@@ -1883,7 +1894,11 @@ void loop() {
             phone = readCnum();
             if (isIranMsisdn(phone)) {
                 SerialMon.printf("[SIM] شماره از CNUM=%s\n", phone.c_str());
+#if USE_WIFI_TRANSPORT
+                enterState(sessionToken.length() ? ST_REGISTER_AM : ST_SEND_CODE);
+#else
                 enterTransportWait();
+#endif
             } else {
                 SerialMon.println("[SIM] شماره در جدول ICCID نیست. در سریال بزنید: PHONE 98912xxxxxxx");
             }
@@ -1900,7 +1915,16 @@ void loop() {
                                  WiFi.localIP().toString().c_str(), wifiSsid(),
                                  EITAA_GATEWAY_URL);
 #endif
-                enterState(sessionToken.length() ? ST_REGISTER_AM : ST_SEND_CODE);
+                if (isIranMsisdn(phone)) {
+                    // Reconnect after drop: transport already passed initial setup.
+                    // Skip IMEI rotation (idempotent anyway) and go straight back.
+                    enterState(sessionToken.length() ? ST_REGISTER_AM : ST_SEND_CODE);
+                } else {
+                    // Initial pass: WiFi just came up for the first time.
+                    // Rotate IMEI BEFORE the modem registers to the cellular network.
+                    rotateImeiIfNewDay();
+                    enterState(ST_WAIT_NET);
+                }
             } else if (millis() - stateEnteredAt > 60000) {
                 lastError = String("wifi timeout ssid=") + wifiSsid();
                 enterState(ST_ERROR);
@@ -1919,6 +1943,8 @@ void loop() {
             lastNetPoll = millis();
             if (ensureGprs()) {
                 SerialMon.printf("[GPRS] آماده ip=%s -> %s\n", gprsIp.c_str(), EITAA_GATEWAY_URL);
+                // GPRS just came up: rotate IMEI now (best-effort, since GPRS needs GSM we can't do it before)
+                rotateImeiIfNewDay();
                 enterState(sessionToken.length() ? ST_REGISTER_AM : ST_SEND_CODE);
             } else if (millis() - stateEnteredAt > GPRS_WAIT_MS) {
                 if (!lastError.length()) lastError = "gprs timeout";
@@ -1950,7 +1976,6 @@ void loop() {
                 enterState(ST_WAIT_FLOOD);
                 break;
             }
-            rotateImeiIfNewDay();
             if (sendCodePosted) {
                 SerialMon.println("[EITAA] sendCode همین دور زده شد؛ تکرار نمی‌شود");
                 enterState(ST_WAIT_SMS);
