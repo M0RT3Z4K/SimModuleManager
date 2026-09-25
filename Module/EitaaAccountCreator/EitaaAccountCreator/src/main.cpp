@@ -473,10 +473,26 @@ String fetchTehranDate() {
 #endif
 }
 
+// Compute IMEI Luhn check digit for the first 14 digits; returns "0".."9".
+char imeiLuhnCheck(const String& first14) {
+    int sum = 0;
+    for (int i = 0; i < 14; i++) {
+        int d = first14.charAt(i) - '0';
+        if ((i + 1) % 2 == 0) { // double even positions (2,4,...,14)
+            d *= 2;
+            if (d > 9) d -= 9;
+        }
+        sum += d;
+    }
+    int check = (10 - (sum % 10)) % 10;
+    return char('0' + check);
+}
+
 String buildDatedImei(const String& date) {
     String base = readModemImei();
-    if (base.length() < 7 || date.length() != 8) return "";
-    return base.substring(0, 7) + date;
+    if (base.length() < 6 || date.length() != 8) return "";
+    String first14 = base.substring(0, 6) + date; // 6 prefix + 8 date = 14
+    return first14 + imeiLuhnCheck(first14);       // +1 Luhn = 15
 }
 
 void setModemImei(const String& imei) {
@@ -497,25 +513,27 @@ void rotateImeiIfNewDay() {
         return;
     }
     SerialMon.printf("[IMEI] تاریخ تهران: %s\n", date.c_str());
+    String expected = buildDatedImei(date);
+    if (expected.length() != 15) {
+        SerialMon.printf("[IMEI] ساخت IMEI مورد انتظار ناموفق (len=%d) — رد شد\n", expected.length());
+        return;
+    }
+    String current = readModemImei();
+    if (current.length() >= 15) current = current.substring(0, 15);
+    if (current == expected) {
+        SerialMon.printf("[IMEI] IMEI فعلی (%s) با تاریخ امروز مطابقت دارد — نیازی به چرخش نیست\n", current.c_str());
+        // still record today so we don't re-check every boot
+        Preferences prefs;
+        if (prefs.begin("eitaa-ac", false)) {
+            prefs.putString("imei_date", date);
+            prefs.end();
+        }
+        return;
+    }
+    SerialMon.printf("[IMEI] IMEI فعلی='%s' → مورد انتظار='%s'\n", current.c_str(), expected.c_str());
+    SerialMon.printf("[IMEI] IMEI جدید: %s\n", expected.c_str());
+    setModemImei(expected);
     Preferences prefs;
-    if (!prefs.begin("eitaa-ac", true)) {
-        SerialMon.println("[IMEI] باز کردن Preferences (RO) ناموفق — رد شد");
-        return;
-    }
-    String last = prefs.getString("imei_date", "");
-    prefs.end();
-    if (last == date) {
-        SerialMon.printf("[IMEI] امروز (%s) قبلاً چرخش انجام شده — رد شد\n", date.c_str());
-        return;
-    }
-    SerialMon.printf("[IMEI] آخرین چرخش: '%s' → نیاز به چرخش جدید\n", last.length() ? last.c_str() : "(هیچ)");
-    String imei = buildDatedImei(date);
-    if (imei.length() != 15) {
-        SerialMon.printf("[IMEI] ساخت IMEI ناموفق (len=%d) — رد شد\n", imei.length());
-        return;
-    }
-    SerialMon.printf("[IMEI] IMEI جدید: %s\n", imei.c_str());
-    setModemImei(imei);
     if (!prefs.begin("eitaa-ac", false)) {
         SerialMon.println("[IMEI] باز کردن Preferences (RW) ناموفق — ذخیره نشد");
         return;
