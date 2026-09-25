@@ -116,6 +116,7 @@ static unsigned long lastLedToggle = 0;
 static bool ledOn = false;
 static int sendCodeAttempts = 0;
 static bool sendCodePosted = false;
+static bool initialTransportSetup = false; // true after first WiFi→IMEI→GSM sequence
 static int lastCsq = -1;
 static int lastCreg = -1;
 static unsigned long floodUntilMs = 0;
@@ -1600,6 +1601,7 @@ void resetSessionFields() {
     pendingSmsText = "";
     sendCodeAttempts = 0;
     sendCodePosted = false;
+    initialTransportSetup = false;
     lastError = "";
 }
 
@@ -1915,14 +1917,14 @@ void loop() {
                                  WiFi.localIP().toString().c_str(), wifiSsid(),
                                  EITAA_GATEWAY_URL);
 #endif
-                if (isIranMsisdn(phone)) {
-                    // Reconnect after drop: transport already passed initial setup.
-                    // Skip IMEI rotation (idempotent anyway) and go straight back.
+                if (initialTransportSetup) {
+                    // Reconnect after a drop: transport already passed initial setup.
                     enterState(sessionToken.length() ? ST_REGISTER_AM : ST_SEND_CODE);
                 } else {
                     // Initial pass: WiFi just came up for the first time.
                     // Rotate IMEI BEFORE the modem registers to the cellular network.
                     rotateImeiIfNewDay();
+                    initialTransportSetup = true;
                     enterState(ST_WAIT_NET);
                 }
             } else if (millis() - stateEnteredAt > 60000) {
