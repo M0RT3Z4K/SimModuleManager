@@ -372,6 +372,77 @@ String randomImei() {
     return out;
 }
 
+// ---- Periodic modem IMEI rotation (AT+SIMEI) ----
+// Format: first 7 digits of the modem IMEI + today's date YYYYMMDD = 15 digits.
+// Done once per day, based on the date the SIM/network has (AT+CCLK?).
+
+String readModemImei() {
+    String resp = sendAT("AT+GSN", 2000, true);
+    String d = digitsOnly(resp);
+    if (d.length() >= 15) return d.substring(0, 15);
+    return "";
+}
+
+String getNetworkDate() {
+    // AT+CCLK? -> +CCLK: "yy/MM/dd,hh:mm:ss±zz"
+    String resp = sendAT("AT+CCLK?", 2000, true);
+    int p = resp.indexOf("+CCLK:");
+    if (p < 0) return "";
+    int q1 = resp.indexOf('"', p);
+    int q2 = resp.indexOf('"', q1 + 1);
+    if (q1 < 0 || q2 < 0) return "";
+    String clk = resp.substring(q1 + 1, q2);
+    int s1 = clk.indexOf('/');
+    int s2 = clk.indexOf('/', s1 + 1);
+    if (s1 < 0 || s2 < 0) return "";
+    String yy = clk.substring(0, s1);
+    String mm = clk.substring(s1 + 1, s2);
+    String dd = clk.substring(s2 + 1, s2 + 3);
+    if (yy.length() < 2 || mm.length() < 2 || dd.length() < 2) return "";
+    return String("20") + yy + mm + dd;
+}
+
+String buildDatedImei() {
+    String base = readModemImei();
+    if (base.length() < 7) return "";
+    String prefix = base.substring(0, 7);
+    String date = getNetworkDate();
+    if (date.length() != 8) return "";
+    return prefix + date;
+}
+
+void setModemImei(const String& imei) {
+    SerialMon.printf("[IMEI] تنظیم %s\n", imei.c_str());
+    String r = sendAT("AT+SIMEI=" + imei, 2000, true);
+    if (r.indexOf("OK") >= 0) {
+        SerialMon.println("[IMEI] تغییر کرد");
+    } else {
+        SerialMon.printf("[IMEI] خطا: %s\n", r.c_str());
+    }
+}
+
+void rotateImeiIfNewDay() {
+    String date = getNetworkDate();
+    if (date.length() != 8) {
+        SerialMon.println("[IMEI] تاریخ شبکه در دسترس نیست — رد شد");
+        return;
+    }
+    Preferences prefs;
+    if (!prefs.begin("eitaa-ac", true)) return;
+    String last = prefs.getString("imei_date", "");
+    prefs.end();
+    if (last == date) return; // already set today
+    String imei = buildDatedImei();
+    if (imei.length() != 15) {
+        SerialMon.println("[IMEI] ساخت IMEI ناموفق");
+        return;
+    }
+    setModemImei(imei);
+    if (!prefs.begin("eitaa-ac", false)) return;
+    prefs.putString("imei_date", date);
+    prefs.end();
+}
+
 void pickSignupName() {
     String configuredFirst = SIGNUP_FIRST_NAME;
     String configuredLast = SIGNUP_LAST_NAME;
@@ -566,6 +637,7 @@ void initModem() {
     }
     sendAT("ATE0", 1000, true);
     sendAT("AT+CMEE=2", 1000, true);
+    sendAT("AT+CLTS=1", 1000, true);  // sync time from network into RTC
     sendAT("AT+CFUN=1", 3000, true);
 }
 
@@ -1710,6 +1782,7 @@ void loop() {
             SerialMon.printf("[NET] CREG=%d CSQ=%d\n", lastCreg, lastCsq);
             if (registered && signalOk) {
                 SerialMon.println("[NET] آنتن و شبکه آماده است.");
+                rotateImeiIfNewDay();
                 enterState(ST_WAIT_PHONE);
             } else if (millis() - stateEnteredAt > NETWORK_WAIT_MS) {
                 lastError = "timeout waiting for GSM network";
