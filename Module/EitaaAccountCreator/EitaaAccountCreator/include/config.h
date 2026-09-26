@@ -5,6 +5,13 @@
 #include "config.local.h"
 #endif
 
+// IMEI rotation:
+//   ROTATE_IMEI_EVERY_BOOT = 1 → generate a fresh random IMEI on every boot
+//   ROTATE_IMEI_EVERY_BOOT = 0 → set IMEI once, keep it across reboots
+#ifndef ROTATE_IMEI_EVERY_BOOT
+#define ROTATE_IMEI_EVERY_BOOT 0
+#endif
+
 // Transport (pick one):
 //   USE_PHONE_HOTSPOT     — WiFi to the phone, onboard TL gateway (direct Eitaa)
 //   USE_INTERNAL_NETWORK  — office LAN (Otaq + 10.10.20.51)

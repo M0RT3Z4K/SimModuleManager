@@ -403,76 +403,6 @@ String getNetworkDate() {
     return String("20") + yy + mm + dd;
 }
 
-// Parse an HTTP `Date:` header ("Sat, 26 Sep 2026 18:45:00 GMT")
-// and return today's date in Tehran (UTC+3:30) as YYYYMMDD.
-String parseHttpDateToTehran(const String& hdr) {
-    int c1 = hdr.indexOf(',');
-    if (c1 < 0) return "";
-    String rest = hdr.substring(c1 + 2);
-    rest.trim();
-    int sp1 = rest.indexOf(' ');
-    int sp2 = rest.indexOf(' ', sp1 + 1);
-    int sp3 = rest.indexOf(' ', sp2 + 1);
-    if (sp1 < 0 || sp2 < 0 || sp3 < 0) return "";
-    int day = rest.substring(0, sp1).toInt();
-    String monStr = rest.substring(sp1 + 1, sp2);
-    int year = rest.substring(sp2 + 1, sp3).toInt();
-    String timeStr = rest.substring(sp3 + 1);
-    int hh = timeStr.substring(0, 2).toInt();
-    int mm = timeStr.substring(3, 5).toInt();
-    int ss = timeStr.substring(6, 8).toInt();
-    int month = 0;
-    const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
-    for (int i = 0; i < 12; ++i) {
-        if (monStr == months[i]) { month = i + 1; break; }
-    }
-    if (month == 0 || day <= 0 || year <= 0) return "";
-
-    // Tehran = UTC + 3:30. Add 3:30 and handle day rollover.
-    long totalMin = (long)hh * 60 + mm + 3 * 60 + 30 + (ss >= 30 ? 1 : 0);
-    int dayAdd = (int)(totalMin / (24 * 60));
-    int newMin = (int)(totalMin % (24 * 60));
-    (void)newMin;
-    int newDay = day + dayAdd;
-
-    int dim[] = {31,28,31,30,31,30,31,31,30,31,30,31};
-    bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
-    if (leap) dim[1] = 29;
-    if (newDay > dim[month - 1]) {
-        newDay = 1;
-        month += 1;
-        if (month > 12) { month = 1; year += 1; }
-    }
-    char buf[9];
-    snprintf(buf, sizeof(buf), "%04d%02d%02d", year, month, newDay);
-    return String(buf);
-}
-
-String fetchTehranDate() {
-#if USE_WIFI_TRANSPORT
-    if (WiFi.status() != WL_CONNECTED) return "";
-    LoopWdtHold pauseWdt;
-    WiFiClient client;
-    HTTPClient http;
-    http.setTimeout(8000);
-    const char* hdrs[] = {"Date"};
-    http.collectHeaders(hdrs, 1);
-    if (!http.begin(client, "http://time.ir/")) return "";
-    int code = http.GET();
-    if (code <= 0) { http.end(); return ""; }
-    String dateHdr = http.header("Date");
-    http.end();
-    if (dateHdr.length() < 25) return "";
-    String d = parseHttpDateToTehran(dateHdr);
-    if (d.length() == 8) {
-        SerialMon.printf("[TIME] time.ir Date=%s → تهران %s\n", dateHdr.c_str(), d.c_str());
-    }
-    return d;
-#else
-    return getNetworkDate();
-#endif
-}
-
 // Compute IMEI Luhn check digit for the first 14 digits; returns "0".."9".
 char imeiLuhnCheck(const String& first14) {
     int sum = 0;
@@ -488,11 +418,22 @@ char imeiLuhnCheck(const String& first14) {
     return char('0' + check);
 }
 
-String buildDatedImei(const String& date) {
+bool imeiLuhnValid(const String& imei) {
+    if (imei.length() != 15) return false;
+    for (int i = 0; i < 15; i++) if (!isdigit((unsigned char)imei.charAt(i))) return false;
+    return imei.charAt(14) == imeiLuhnCheck(imei.substring(0, 14));
+}
+
+// Build a random valid IMEI: factory TAC (first 8 digits from AT+GSN)
+// + 6 random SNR digits + Luhn check digit = 15.
+String buildRandomImei() {
     String base = readModemImei();
-    if (base.length() < 6 || date.length() != 8) return "";
-    String first14 = base.substring(0, 6) + date; // 6 prefix + 8 date = 14
-    return first14 + imeiLuhnCheck(first14);       // +1 Luhn = 15
+    if (base.length() < 8) return "";
+    String first14 = base.substring(0, 8); // TAC
+    for (int i = 0; i < 6; i++) {
+        first14 += char('0' + (esp_random() % 10));
+    }
+    return first14 + imeiLuhnCheck(first14);
 }
 
 void setModemImei(const String& imei) {
@@ -505,42 +446,78 @@ void setModemImei(const String& imei) {
     }
 }
 
-void rotateImeiIfNewDay() {
-    SerialMon.println("[IMEI] شروع چرخش IMEI روزانه...");
-    String date = fetchTehranDate();
-    if (date.length() != 8) {
-        SerialMon.printf("[IMEI] تاریخ از time.ir در دسترس نیست (got='%s') — رد شد\n", date.c_str());
-        return;
-    }
-    SerialMon.printf("[IMEI] تاریخ تهران: %s\n", date.c_str());
-    String expected = buildDatedImei(date);
-    if (expected.length() != 15) {
-        SerialMon.printf("[IMEI] ساخت IMEI مورد انتظار ناموفق (len=%d) — رد شد\n", expected.length());
-        return;
-    }
+// Ensure the modem has a Luhn-valid IMEI.
+//   ROTATE_IMEI_EVERY_BOOT = 1 → always generate a fresh random IMEI on every boot
+//   ROTATE_IMEI_EVERY_BOOT = 0 → set once and reuse across reboots (default)
+void ensureImeiSet() {
+    SerialMon.println("[IMEI] بررسی IMEI مودم...");
     String current = readModemImei();
     if (current.length() >= 15) current = current.substring(0, 15);
-    if (current == expected) {
-        SerialMon.printf("[IMEI] IMEI فعلی (%s) با تاریخ امروز مطابقت دارد — نیازی به چرخش نیست\n", current.c_str());
-        // still record today so we don't re-check every boot
-        Preferences prefs;
+
+#if ROTATE_IMEI_EVERY_BOOT
+    // Always generate a fresh random IMEI on every boot.
+    SerialMon.println("[IMEI] ROTATE_IMEI_EVERY_BOOT=1 → ساخت رندوم جدید در هر بوت");
+    String generated = buildRandomImei();
+    if (generated.length() != 15) {
+        SerialMon.printf("[IMEI] ساخت IMEI رندوم ناموفق (len=%d)\n", generated.length());
+        return;
+    }
+    if (current == generated) {
+        // extremely unlikely, but force a different one by retrying a few times
+        for (int i = 0; i < 8 && current == generated; i++) {
+            generated = buildRandomImei();
+        }
+    }
+    SerialMon.printf("[IMEI] IMEI فعلی='%s' → رندوم جدید: %s\n", current.c_str(), generated.c_str());
+    setModemImei(generated);
+    Preferences prefs;
+    if (prefs.begin("eitaa-ac", false)) {
+        prefs.putString("imei_set", generated);
+        prefs.end();
+    }
+    SerialMon.println("[IMEI] IMEI رندوم جدید ست و ذخیره شد.");
+    return;
+#else
+    // Set once and reuse across reboots.
+    Preferences prefs;
+    if (prefs.begin("eitaa-ac", true)) {
+        String stored = prefs.getString("imei_set", "");
+        prefs.end();
+        if (stored.length() == 15 && imeiLuhnValid(stored)) {
+            if (current == stored) {
+                SerialMon.printf("[IMEI] IMEI فعلی (%s) معتبر و مطابق ذخیره — نیازی به تغییر نیست\n", current.c_str());
+                return;
+            }
+            SerialMon.printf("[IMEI] IMEI ذخیره‌شده=%s ولی فعلی=%s → تنظیم مجدد\n", stored.c_str(), current.c_str());
+            setModemImei(stored);
+            return;
+        }
+    }
+
+    // No valid stored IMEI: check current
+    if (imeiLuhnValid(current)) {
+        SerialMon.printf("[IMEI] IMEI فعلی (%s) معتبر است — ذخیره\n", current.c_str());
         if (prefs.begin("eitaa-ac", false)) {
-            prefs.putString("imei_date", date);
+            prefs.putString("imei_set", current);
             prefs.end();
         }
         return;
     }
-    SerialMon.printf("[IMEI] IMEI فعلی='%s' → مورد انتظار='%s'\n", current.c_str(), expected.c_str());
-    SerialMon.printf("[IMEI] IMEI جدید: %s\n", expected.c_str());
-    setModemImei(expected);
-    Preferences prefs;
-    if (!prefs.begin("eitaa-ac", false)) {
-        SerialMon.println("[IMEI] باز کردن Preferences (RW) ناموفق — ذخیره نشد");
+
+    // Current is invalid: generate a random valid one
+    String generated = buildRandomImei();
+    if (generated.length() != 15) {
+        SerialMon.printf("[IMEI] ساخت IMEI رندوم ناموفق (len=%d)\n", generated.length());
         return;
     }
-    prefs.putString("imei_date", date);
-    prefs.end();
-    SerialMon.println("[IMEI] چرخش IMEI کامل شد و تاریخ ذخیره شد.");
+    SerialMon.printf("[IMEI] IMEI فعلی='%s' نامعتبر → تولید رندوم: %s\n", current.c_str(), generated.c_str());
+    setModemImei(generated);
+    if (prefs.begin("eitaa-ac", false)) {
+        prefs.putString("imei_set", generated);
+        prefs.end();
+    }
+    SerialMon.println("[IMEI] IMEI رندوم ست و ذخیره شد.");
+#endif
 }
 
 void pickSignupName() {
@@ -1732,7 +1709,34 @@ void handleSerialLine(String line) {
                          lastError.c_str());
         return;
     }
-    SerialMon.println("[CFG] دستورها: PHONE 9891… | LABEL نام | RETRY | STATUS");
+    if (upper == "NEWIMEI") {
+        // Force-generate a new random IMEI: clear stored, build a fresh one, set it.
+        SerialMon.println("[CFG] NEWIMEI — پاک کردن IMEI ذخیره‌شده و ساخت رندوم جدید");
+        Preferences prefs;
+        if (prefs.begin("eitaa-ac", false)) {
+            prefs.remove("imei_set");
+            prefs.end();
+        }
+        // Also corrupt the modem IMEI so ensureImeiSet() will regenerate
+        setModemImei("000000000000000");
+        ensureImeiSet();
+        return;
+    }
+    if (upper == "IMEI") {
+        // Show current modem IMEI and validity
+        String cur = readModemImei();
+        if (cur.length() >= 15) cur = cur.substring(0, 15);
+        SerialMon.printf("[IMEI] فعلی=%s valid=%s\n", cur.c_str(),
+                         imeiLuhnValid(cur) ? "true" : "false");
+        Preferences prefs;
+        if (prefs.begin("eitaa-ac", true)) {
+            String stored = prefs.getString("imei_set", "");
+            prefs.end();
+            SerialMon.printf("[IMEI] ذخیره‌شده=%s\n", stored.c_str());
+        }
+        return;
+    }
+    SerialMon.println("[CFG] دستورها: PHONE 9891… | LABEL نام | RETRY | STATUS | NEWIMEI | IMEI");
 }
 
 void serviceSerial() {
@@ -1811,7 +1815,7 @@ void setup() {
 #else
     SerialMon.println("Transport: داده سیم‌کارت (GPRS + TLS روی ESP32)");
 #endif
-    SerialMon.println("دستور سریال: PHONE 9891… | LABEL … | RETRY | STATUS");
+    SerialMon.println("دستور سریال: PHONE 9891… | LABEL … | RETRY | STATUS | NEWIMEI | IMEI");
 
     phone = normalizePhone(PHONE_NUMBER);
 
@@ -1940,8 +1944,8 @@ void loop() {
                     enterState(sessionToken.length() ? ST_REGISTER_AM : ST_SEND_CODE);
                 } else {
                     // Initial pass: WiFi just came up for the first time.
-                    // Rotate IMEI BEFORE the modem registers to the cellular network.
-                    rotateImeiIfNewDay();
+                    // Set a valid IMEI BEFORE the modem registers to the cellular network.
+                    ensureImeiSet();
                     initialTransportSetup = true;
                     enterState(ST_WAIT_NET);
                 }
@@ -1963,8 +1967,8 @@ void loop() {
             lastNetPoll = millis();
             if (ensureGprs()) {
                 SerialMon.printf("[GPRS] آماده ip=%s -> %s\n", gprsIp.c_str(), EITAA_GATEWAY_URL);
-                // GPRS just came up: rotate IMEI now (best-effort, since GPRS needs GSM we can't do it before)
-                rotateImeiIfNewDay();
+                // GPRS just came up: ensure valid IMEI (best-effort, since GPRS needs GSM we can't do it before)
+                ensureImeiSet();
                 enterState(sessionToken.length() ? ST_REGISTER_AM : ST_SEND_CODE);
             } else if (millis() - stateEnteredAt > GPRS_WAIT_MS) {
                 if (!lastError.length()) lastError = "gprs timeout";
